@@ -1,6 +1,7 @@
 streamlit
-plotly
-pandas
 numpy
+pandas
+plotly
 scipy
-ib_insync
+yfinance
+ib-insync
