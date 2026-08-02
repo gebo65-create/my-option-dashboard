@@ -3,10 +3,19 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from scipy.stats import norm
+import yfinance as yf
+from datetime import datetime
+
+# Versuche ib_insync zu importieren (falls installiert)
+try:
+    from ib_insync import IB, Option, util
+    IBKR_AVAILABLE = True
+except ImportError:
+    IBKR_AVAILABLE = False
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Interactive Position Manager", 
+    page_title="OptionNet Explorer - Live Data & IBKR Integration", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -25,7 +34,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- BLACK-SCHOLES HELPER FUNCTIONS ---
+# --- BLACK-SCHOLES & GREEKS HELPER FUNCTIONS ---
 def bs_price(option_type, S, K, T, r, sigma):
     if T <= 0.00001:
         return np.maximum(0.0, S - K) if option_type == 'C' else np.maximum(0.0, K - S)
@@ -71,6 +80,26 @@ def strike_from_delta(option_type, target_delta_pct, S, T, r, sigma):
     K = S * np.exp(-d1 * sigma * np.sqrt(T) + (r + 0.5 * sigma**2) * T)
     return round(K / 5.0) * 5.0
 
+# --- LIVE DATA FETCHER (YFINANCE - 5 MIN CACHE) ---
+TICKER_MAP = {
+    "SPX": "^GSPC",
+    "DAX": "^GDAXI",
+    "SPY": "SPY",
+    "QQQ": "QQQ",
+    "RUT": "^RUT"
+}
+
+@st.cache_data(ttl=300)
+def fetch_delayed_spot(ticker_symbol):
+    try:
+        t = yf.Ticker(ticker_symbol)
+        data = t.history(period="1d", interval="1m")
+        if not data.empty:
+            return round(float(data["Close"].iloc[-1]), 2)
+    except Exception:
+        pass
+    return None
+
 def generate_dte_iv_table(spot_price, base_iv, r=0.045):
     records = []
     for dte in range(0, 41):
@@ -102,30 +131,100 @@ def generate_dte_iv_table(spot_price, base_iv, r=0.045):
     return pd.DataFrame(records)
 
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.title("⚙️ Base Settings")
+# --- IBKR POSITIONS IMPORT ENGINE ---
+def fetch_ibkr_positions(host='127.0.0.1', port=7497, client_id=1):
+    if not IBKR_AVAILABLE:
+        st.error("Das Paket 'ib_insync' ist nicht installiert. Bitte 'pip install ib-insync' ausführen.")
+        return None
+        
+    ib = IB()
+    try:
+        ib.connect(host, port, clientId=client_id, timeout=5)
+        positions = ib.positions()
+        
+        imported_legs = []
+        today = datetime.now().date()
+        
+        for pos in positions:
+            contract = pos.contract
+            # Nur Optionskontrakte filtern
+            if contract.secType == 'OPT':
+                # DTE Berechnung
+                exp_date = datetime.strptime(contract.lastTradeDateOrContractMonth, "%Y%m%d").date()
+                dte = max(0, (exp_date - today).days)
+                
+                multiplier = float(contract.multiplier) if contract.multiplier else 100.0
+                entry_price = round(pos.avgCost / multiplier, 2)
+                
+                imported_legs.append({
+                    "Enable": True,
+                    "Phase": "Initial",
+                    "Type": "C" if contract.right == "C" or contract.right == "CALL" else "P",
+                    "Strike": float(contract.strike),
+                    "DTE": int(dte),
+                    "IV_%": 18.0, # Standardwert (kann angepasst werden)
+                    "Qty": int(pos.position),
+                    "Entry_Price": entry_price
+                })
+                
+        ib.disconnect()
+        return pd.DataFrame(imported_legs) if imported_legs else pd.DataFrame()
+        
+    except Exception as e:
+        st.error(f"Verbindungsfehler zu IBKR TWS: {e}")
+        if ib.isConnected():
+            ib.disconnect()
+        return None
 
-underlying_symbol = st.sidebar.selectbox("Underlying", ["SPX", "SPY", "QQQ", "DAX", "RUT"], index=0)
-spot_price = st.sidebar.number_input("Current Spot Price", value=600.0, step=1.0)
+
+# --- SIDEBAR CONTROLS ---
+st.sidebar.title("⚙️ Base & Data Settings")
+
+underlying_symbol = st.sidebar.selectbox("Underlying Symbol", list(TICKER_MAP.keys()), index=0)
+ticker = TICKER_MAP[underlying_symbol]
+
+# Automatischer 5-Minuten Abruf
+live_spot = fetch_delayed_spot(ticker)
+default_spot = live_spot if live_spot is not None else 600.0
+
+spot_price = st.sidebar.number_input(
+    f"Current Spot Price ({'Live/Delayed' if live_spot else 'Manual'})", 
+    value=default_spot, 
+    step=1.0
+)
+
 base_iv = st.sidebar.number_input("Base IV (%)", value=18.0, step=0.5)
 risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", value=4.5, step=0.1) / 100.0
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("🔌 Interactive Brokers (TWS) Import")
+
+ib_port = st.sidebar.number_input("TWS Port (7497 Paper / 7496 Live)", value=7497, step=1)
+
+if st.sidebar.button("📥 Positions aus TWS Laden"):
+    with st.spinner("Verbinde mit TWS und lade Positionen..."):
+        ib_df = fetch_ibkr_positions(port=int(ib_port))
+        if ib_df is not None:
+            if not ib_df.empty:
+                st.session_state["legs_df"] = ib_df
+                st.sidebar.success(f"{len(ib_df)} Beine von IBKR importiert!")
+                st.rerun()
+            else:
+                st.sidebar.warning("Keine offenen Optionspositionen in TWS gefunden.")
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("📝 Portfolio Positions Manager")
 
-# Standard-Positionen setzen falls Session Leer
 default_legs = [
     {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": spot_price, "DTE": 30, "IV_%": base_iv, "Qty": 10, "Entry_Price": 12.0},
     {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": spot_price * 0.95, "DTE": 30, "IV_%": base_iv, "Qty": -10, "Entry_Price": 6.0},
-    {"Enable": True, "Phase": "Adjustment", "Type": "C", "Strike": spot_price * 1.05, "DTE": 15, "IV_%": base_iv, "Qty": -5, "Entry_Price": 4.5},
 ]
 
 if "legs_df" not in st.session_state:
     st.session_state["legs_df"] = pd.DataFrame(default_legs)
 
-# Buttons zum Zurücksetzen oder komplett Leeren der Tabelle
 col_btn1, col_btn2 = st.sidebar.columns(2)
-if col_btn1.button("🔄 Reset Legs"):
+if col_btn1.button("🔄 Reset Default"):
     st.session_state["legs_df"] = pd.DataFrame(default_legs)
     st.rerun()
 
@@ -133,7 +232,7 @@ if col_btn2.button("🗑️ Alle Löschen"):
     st.session_state["legs_df"] = pd.DataFrame(columns=["Enable", "Phase", "Type", "Strike", "DTE", "IV_%", "Qty", "Entry_Price"])
     st.rerun()
 
-# Interaktiver Editor für Beine
+# Interaktiver Table-Editor
 edited_df = st.sidebar.data_editor(
     st.session_state["legs_df"],
     num_rows="dynamic",
@@ -150,7 +249,6 @@ edited_df = st.sidebar.data_editor(
     }
 )
 
-# Übernehme Änderungen im State
 st.session_state["legs_df"] = edited_df
 
 
@@ -187,25 +285,20 @@ if not active_legs.empty:
             t_t0 = max(0.00001, dte / 365.0)
             t_t1 = max(0.00001, max(0.0, dte - 1) / 365.0)
             
-            # Expiration
             exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
             pnl_exp += (exp_prices - entry) * qty * 100.0
             
-            # T+0 Curve
             t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
             pnl_t0 += (t0_prices - entry) * qty * 100.0
             
-            # T+1 Curve
             t1_prices = np.array([bs_price(opt_type, s, strike, t_t1, risk_free_rate, iv) for s in spot_range])
             pnl_t1 += (t1_prices - entry) * qty * 100.0
             
-            # Spot PnL Values
             val_t0 = bs_price(opt_type, spot_price, strike, t_t0, risk_free_rate, iv)
             val_t1 = bs_price(opt_type, spot_price, strike, t_t1, risk_free_rate, iv)
             spot_pnl_t0 += (val_t0 - entry) * qty * 100.0
             spot_pnl_t1 += (val_t1 - entry) * qty * 100.0
             
-            # Net Greeks
             g = bs_greeks(opt_type, spot_price, strike, t_t0, risk_free_rate, iv)
             tot_delta += g['delta'] * qty * 100.0
             tot_gamma += g['gamma'] * qty * 100.0
@@ -232,7 +325,7 @@ if not initial_legs.empty and len(active_legs) > len(initial_legs):
 
 
 # --- DASHBOARD LAYOUT ---
-st.title(f"📈 OptionNet Explorer - Position Analytics ({underlying_symbol})")
+st.title(f"📈 OptionNet Explorer ({underlying_symbol})")
 
 # Header KPI Metrics
 k1, k2, k3, k4, k5 = st.columns(5)
@@ -249,21 +342,18 @@ st.subheader("📉 Position Risk Graph (T+0 & T+1 mit Spot Price Marker)")
 
 fig = go.Figure()
 
-# 1. Total Position T+0 (Heute)
 fig.add_trace(go.Scatter(
     x=spot_range, y=pnl_t0, mode='lines', name='T+0 (Gesamte Position Heute)',
     line=dict(color='#ff5252', width=3),
     hovertemplate="Spot: %{x:.2f}<br>PnL T+0: $%{y:,.2f}"
 ))
 
-# 2. Total Position T+1 (Morgen)
 fig.add_trace(go.Scatter(
     x=spot_range, y=pnl_t1, mode='lines', name='T+1 (Gesamte Position Morgen)',
     line=dict(color='#66bb6a', width=2, dash='dash'),
     hovertemplate="Spot: %{x:.2f}<br>PnL T+1: $%{y:,.2f}"
 ))
 
-# 3. Initial Position (Falls Adjustments existieren)
 if not initial_legs.empty and len(active_legs) > len(initial_legs):
     fig.add_trace(go.Scatter(
         x=spot_range, y=pnl_initial_t0, mode='lines', name='Initial Position (Vor Adjustment)',
@@ -271,7 +361,6 @@ if not initial_legs.empty and len(active_legs) > len(initial_legs):
         hovertemplate="Spot: %{x:.2f}<br>Initial PnL: $%{y:,.2f}"
     ))
 
-# 4. Expiration Curve
 fig.add_trace(go.Scatter(
     x=spot_range, y=pnl_exp, mode='lines', name='Expiration PnL',
     line=dict(color='#29b6f6', width=1.5),
@@ -279,8 +368,6 @@ fig.add_trace(go.Scatter(
 ))
 
 fig.add_hline(y=0, line_dash="solid", line_color="#455a64", line_width=1)
-
-# Spot Line
 fig.add_vline(x=spot_price, line_dash="dot", line_color="#ffffff", line_width=1.5)
 
 # T+0 Marker Annotation am Spot Price
@@ -318,8 +405,7 @@ st.subheader("📅 DTE 0 bis 40 - Implizierte Volatilität, Expected Move & Stri
 
 dte_df = generate_dte_iv_table(spot_price, base_iv, r=risk_free_rate)
 
-# Filter-Optionen für DTE
-f_col1, f_col2 = st.columns([3, 1])
+f_col1, _ = st.columns([3, 1])
 dte_range = f_col1.slider("DTE Bereich eingrenzen", 0, 40, (0, 40))
 filtered_dte_df = dte_df[(dte_df["DTE"] >= dte_range[0]) & (dte_df["DTE"] <= dte_range[1])]
 
