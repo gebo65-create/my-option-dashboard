@@ -28,7 +28,7 @@ except ImportError:
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Full Chain, Risk & Margin", 
+    page_title="OptionNet Explorer - Multi-Strategy Dashboard", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -127,12 +127,14 @@ def calculate_phase_margin(legs_subset, spot_price):
     total_margin = 0.0
     for _, row in legs_subset.iterrows():
         try:
+            if pd.isna(row.get("Qty")) or pd.isna(row.get("Strike")) or pd.isna(row.get("Entry_Price")):
+                continue
+
             qty = float(row["Qty"])
             strike = float(row["Strike"])
             opt_type = str(row["Type"])
             entry = float(row["Entry_Price"])
             
-            # Nur Short-Positionen erfordern explizite Margin nach Standard-Regeln
             if qty < 0:
                 abs_qty = abs(qty)
                 if opt_type == 'P':
@@ -147,9 +149,8 @@ def calculate_phase_margin(legs_subset, spot_price):
                     leg_margin = max(reg_t_margin, min_margin)
                 total_margin += leg_margin
             else:
-                # Long Option: Margin ist die gezahlte Prämie
                 total_margin += (entry * 100.0 * qty)
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, TypeError):
             continue
             
     return round(total_margin, 2)
@@ -212,6 +213,13 @@ def fetch_delayed_spot(ticker_symbol):
         pass
     return None
 
+def get_default_legs(current_spot, current_iv):
+    return [
+        {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": round(current_spot, -1), "DTE": 30, "IV_%": current_iv, "Qty": 10, "Entry_Price": round(current_spot * 0.02, 2)},
+        {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(current_spot * 0.95, -1), "DTE": 30, "IV_%": current_iv, "Qty": -10, "Entry_Price": round(current_spot * 0.01, 2)},
+        {"Enable": True, "Phase": "Adjustment", "Type": "P", "Strike": round(current_spot * 0.90, -1), "DTE": 20, "IV_%": current_iv + 2, "Qty": -5, "Entry_Price": round(current_spot * 0.008, 2)},
+    ]
+
 # --- SIDEBAR & PORTFOLIO ---
 st.sidebar.title("⚙️ Base Settings & Positions")
 
@@ -234,38 +242,65 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🛡️ Display Options")
 show_margin = st.sidebar.checkbox("Margin Details anzeigen", value=True)
 
-def get_default_legs(current_spot, current_iv):
-    return [
-        {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": round(current_spot, -1), "DTE": 30, "IV_%": current_iv, "Qty": 10, "Entry_Price": round(current_spot * 0.02, 2)},
-        {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(current_spot * 0.95, -1), "DTE": 30, "IV_%": current_iv, "Qty": -10, "Entry_Price": round(current_spot * 0.01, 2)},
-        {"Enable": True, "Phase": "Adjustment", "Type": "P", "Strike": round(current_spot * 0.90, -1), "DTE": 20, "IV_%": current_iv + 2, "Qty": -5, "Entry_Price": round(current_spot * 0.008, 2)},
-    ]
-
-if "last_symbol" not in st.session_state:
-    st.session_state["last_symbol"] = underlying_symbol
-    st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
-
-if st.session_state["last_symbol"] != underlying_symbol:
-    st.session_state["last_symbol"] = underlying_symbol
-    st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
-    st.rerun()
-
+# --- MULTI-POSITION / MULTI-STRATEGY MANAGER ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("📝 Portfolio Manager")
+st.sidebar.subheader("🔀 Strategie / Position Manager")
+
+# Initialisiere Multi-Portfolio Daten im Session State
+if "portfolios" not in st.session_state:
+    st.session_state["portfolios"] = {
+        "Position 1 (Hauptposition)": pd.DataFrame(get_default_legs(spot_price, base_iv)),
+        "Position 2 (Hedge/Spread)": pd.DataFrame([
+            {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(spot_price * 0.92, -1), "DTE": 45, "IV_%": base_iv, "Qty": 5, "Entry_Price": round(spot_price * 0.015, 2)}
+        ])
+    }
+    st.session_state["active_portfolio_name"] = "Position 1 (Hauptposition)"
+
+# Dropdown zur Auswahl der aktiven Position
+portfolio_names = list(st.session_state["portfolios"].keys())
+
+selected_pos = st.sidebar.selectbox(
+    "Aktive Position wählen:", 
+    options=portfolio_names, 
+    index=portfolio_names.index(st.session_state["active_portfolio_name"]) if st.session_state["active_portfolio_name"] in portfolio_names else 0
+)
+
+st.session_state["active_portfolio_name"] = selected_pos
+
+# Neue Position erstellen
+with st.sidebar.expander("➕ Neue Position erstellen"):
+    new_pos_name = st.text_input("Name der neuen Position:", placeholder="z.B. Iron Condor SPX")
+    if st.button("Position anlegen"):
+        if new_pos_name and new_pos_name not in st.session_state["portfolios"]:
+            st.session_state["portfolios"][new_pos_name] = pd.DataFrame(columns=["Enable", "Phase", "Type", "Strike", "DTE", "IV_%", "Qty", "Entry_Price"])
+            st.session_state["active_portfolio_name"] = new_pos_name
+            st.rerun()
+        elif new_pos_name in st.session_state["portfolios"]:
+            st.warning("Eine Position mit diesem Namen existiert bereits!")
+
+# Aktive Position löschen
+if len(st.session_state["portfolios"]) > 1:
+    if st.sidebar.button(f"🗑️ '{selected_pos}' löschen"):
+        del st.session_state["portfolios"][selected_pos]
+        st.session_state["active_portfolio_name"] = list(st.session_state["portfolios"].keys())[0]
+        st.rerun()
+
+st.sidebar.markdown(f"**Bearbeite: `{selected_pos}`**")
 
 col_btn1, col_btn2 = st.sidebar.columns(2)
-if col_btn1.button("🔄 Reset Portfolio"):
-    st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
+if col_btn1.button("🔄 Reset Legs"):
+    st.session_state["portfolios"][selected_pos] = pd.DataFrame(get_default_legs(spot_price, base_iv))
     st.rerun()
 
-if col_btn2.button("🗑️ Clear All"):
-    st.session_state["legs_df"] = pd.DataFrame(columns=["Enable", "Phase", "Type", "Strike", "DTE", "IV_%", "Qty", "Entry_Price"])
+if col_btn2.button("🗑️ Clear Legs"):
+    st.session_state["portfolios"][selected_pos] = pd.DataFrame(columns=["Enable", "Phase", "Type", "Strike", "DTE", "IV_%", "Qty", "Entry_Price"])
     st.rerun()
 
+# Data Editor speichert direkt in die gewählte Strategie
 edited_df = st.sidebar.data_editor(
-    st.session_state["legs_df"],
+    st.session_state["portfolios"][selected_pos],
     num_rows="dynamic",
-    key="portfolio_editor",
+    key=f"portfolio_editor_{selected_pos}",
     column_config={
         "Enable": st.column_config.CheckboxColumn("Aktiv", default=True),
         "Phase": st.column_config.SelectboxColumn("Phase", options=["Initial", "Adjustment"], default="Initial"),
@@ -278,12 +313,11 @@ edited_df = st.sidebar.data_editor(
     }
 )
 
-st.session_state["legs_df"] = edited_df
+st.session_state["portfolios"][selected_pos] = edited_df
 
-# --- PNL & RISK CALCULATION ---
+# --- PNL & RISK CALCULATION FOR ACTIVE PORTFOLIO ---
 active_legs = edited_df[edited_df["Enable"] == True].copy() if not edited_df.empty else pd.DataFrame()
 
-# Separate Phasen für Margin
 initial_legs = active_legs[active_legs["Phase"] == "Initial"] if not active_legs.empty else pd.DataFrame()
 adj_legs = active_legs[active_legs["Phase"] == "Adjustment"] if not active_legs.empty else pd.DataFrame()
 
@@ -291,9 +325,13 @@ margin_initial = calculate_phase_margin(initial_legs, spot_price)
 margin_adj = calculate_phase_margin(adj_legs, spot_price)
 margin_total = calculate_phase_margin(active_legs, spot_price)
 
-if not active_legs.empty and "Strike" in active_legs and len(active_legs["Strike"].dropna()) > 0:
-    min_strike = active_legs["Strike"].min()
-    max_strike = active_legs["Strike"].max()
+valid_strikes = []
+if not active_legs.empty and "Strike" in active_legs:
+    valid_strikes = [float(s) for s in active_legs["Strike"].dropna() if pd.notna(s)]
+
+if len(valid_strikes) > 0:
+    min_strike = min(valid_strikes)
+    max_strike = max(valid_strikes)
     x_min = min(spot_price * 0.85, min_strike * 0.90)
     x_max = max(spot_price * 1.15, max_strike * 1.10)
 else:
@@ -312,6 +350,9 @@ tot_delta, tot_gamma, tot_theta, tot_vega = 0.0, 0.0, 0.0, 0.0
 if not active_legs.empty:
     for _, row in active_legs.iterrows():
         try:
+            if pd.isna(row.get("Qty")) or pd.isna(row.get("Strike")) or pd.isna(row.get("DTE")) or pd.isna(row.get("IV_%")) or pd.isna(row.get("Entry_Price")):
+                continue
+
             opt_type = str(row["Type"])
             strike = float(row["Strike"])
             dte = float(row["DTE"])
@@ -341,20 +382,21 @@ if not active_legs.empty:
             tot_gamma += g['gamma'] * qty * 100.0
             tot_theta += g['theta'] * qty * 100.0
             tot_vega += g['vega'] * qty * 100.0
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, TypeError):
             continue
 
 # --- MAIN WORKSPACE ---
 st.title(f"📈 OptionNet Explorer Professional ({underlying_symbol})")
+st.caption(f"Aktuell angezeigte Strategie/Position: **{selected_pos}**")
 
-# Dynamische KPI Spaltenanzahl je nach Margin Toggle
+# KPI Spalten
 if show_margin:
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("PnL T+0 (Heute)", f"${spot_pnl_t0:,.2f}")
     m2.metric("PnL T+1 (Morgen)", f"${spot_pnl_t1:,.2f}", f"${(spot_pnl_t1 - spot_pnl_t0):,.2f}")
     m3.metric("Position Delta", f"{tot_delta:,.2f}")
     m4.metric("Position Theta", f"${tot_theta:,.2f}")
-    m5.metric("Position Vega", f"{tot_vega:,.2f}")
+    m5.metric("Position Vega", f"${tot_vega:,.2f}")
     m6.metric("Gesamt Margin", f"${margin_total:,.2f}")
 else:
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -362,27 +404,26 @@ else:
     m2.metric("PnL T+1 (Morgen)", f"${spot_pnl_t1:,.2f}", f"${(spot_pnl_t1 - spot_pnl_t0):,.2f}")
     m3.metric("Position Delta", f"{tot_delta:,.2f}")
     m4.metric("Position Theta", f"${tot_theta:,.2f}")
-    m5.metric("Position Vega", f"{tot_vega:,.2f}")
+    m5.metric("Position Vega", f"${tot_vega:,.2f}")
 
 st.markdown("---")
 
-# SECTION 1: MARGIN OVERVIEW PANEL (NUR WENN EIN GESCHALTET)
+# SECTION 1: MARGIN OVERVIEW PANEL
 if show_margin:
-    st.subheader("💵 Margin Breakdown (Original vs. Adjustiert)")
+    st.subheader(f"💵 Margin Breakdown — {selected_pos}")
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
     
     col_m1.metric("Initial Margin (Original)", f"${margin_initial:,.2f}")
     col_m2.metric("Adjustment Margin", f"${margin_adj:,.2f}")
     col_m3.metric("Gesamt Margin", f"${margin_total:,.2f}")
     
-    # Return on Margin Berechnen
     rom_t0 = (spot_pnl_t0 / margin_total * 100.0) if margin_total > 0 else 0.0
     col_m4.metric("Return on Margin (T+0)", f"{rom_t0:.2f}%")
     
     st.markdown("---")
 
 # SECTION 2: RISK GRAPH
-st.subheader("📉 Risk Profile Graph")
+st.subheader(f"📉 Risk Profile Graph — {selected_pos}")
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(x=spot_range, y=pnl_t0, mode='lines', name='T+0 (Heute)', line=dict(color='#ff5252', width=3)))
