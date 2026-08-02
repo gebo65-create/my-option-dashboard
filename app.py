@@ -6,7 +6,7 @@ from scipy.stats import norm
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Pro Margin & Analytics", 
+    page_title="OptionNet Explorer - Dynamic Multi-Leg Analytics", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -15,7 +15,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     [data-testid="stMetricValue"] {
-        font-size: 1.25rem !important;
+        font-size: 1.2rem !important;
         font-weight: bold;
     }
     .main .block-container {
@@ -77,32 +77,38 @@ def calculate_expected_move(S, iv_pct, dte):
     em_points = S * sigma * np.sqrt(T)
     return em_points, S - em_points, S + em_points
 
+def get_moneyness_label(opt_type, strike, spot):
+    diff_pct = (strike - spot) / spot * 100.0
+    if abs(diff_pct) <= 1.5:
+        return "ATM"
+    if opt_type == "C":
+        return "ITM" if strike < spot else "OTM"
+    else:
+        return "ITM" if strike > spot else "OTM"
+
 # --- MARGIN CALCULATION ENGINE ---
 def calculate_leg_margin(legs_df, spot_price):
     if legs_df.empty:
         return 0.0
 
     total_margin = 0.0
-    
-    # Net Debit Calculation (Calendar Margin)
     debit_credit = 0.0
+    
     for _, row in legs_df.iterrows():
         qty = float(row["Qty"])
         price = float(row["Entry_Price"])
-        debit_credit += price * qty * 100.0  # Positive = Debit paid, Negative = Credit received
+        debit_credit += price * qty * 100.0
 
-    # If position is Net Debit (like a Calendar / Long Diagonal), Base Margin = Debit Cost
     if debit_credit > 0:
         total_margin += debit_credit
 
-    # Additional Margin for Short Naked/Spread components
     for _, row in legs_df.iterrows():
         qty = float(row["Qty"])
         strike = float(row["Strike"])
         opt_type = str(row["Type"])
         price = float(row["Entry_Price"])
         
-        if qty < 0:  # Short Options
+        if qty < 0:
             abs_qty = abs(qty)
             if opt_type == "C":
                 otm = max(0.0, strike - spot_price)
@@ -111,43 +117,50 @@ def calculate_leg_margin(legs_df, spot_price):
                 otm = max(0.0, spot_price - strike)
                 margin_req = (0.20 * spot_price - otm + price) * 100.0 * abs_qty
             
-            # Minimum margin per contract rule (~10% underlying value)
             min_margin = (0.10 * strike + price) * 100.0 * abs_qty
             total_margin += max(margin_req, min_margin)
 
     return max(total_margin, 0.0)
 
-# --- STRATEGY BUILDER ---
-def build_custom_strategy(strategy_type, option_mode, S, iv_default=18.0):
+# --- DYNAMIC MULTI-LEG STRATEGY BUILDER ---
+def build_custom_strategy(strategy_type, S, iv_default=18.0):
     iv = iv_default / 100.0
     r = 0.045
     legs = []
     
-    if strategy_type == "Calendar":
-        k_c = strike_from_delta("C", 50, S, 30/365, r, iv)
+    k_atm_c = strike_from_delta("C", 50, S, 30/365, r, iv)
+    k_itm_c = strike_from_delta("C", 70, S, 60/365, r, iv)
+    k_otm_c = strike_from_delta("C", 30, S, 30/365, r, iv)
+    
+    k_atm_p = strike_from_delta("P", 50, S, 30/365, r, iv)
+    k_itm_p = strike_from_delta("P", 70, S, 60/365, r, iv)
+    k_otm_p = strike_from_delta("P", 30, S, 30/365, r, iv)
+
+    if strategy_type == "Multi-Leg Combo (ITM/ATM/OTM)":
         legs.extend([
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -10, "Entry_Price": 12.0, "Close_Price": 0.0},
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_c, "DTE": 60, "Target_Delta": 50, "IV_%": iv_default, "Qty": 10, "Entry_Price": 18.5, "Close_Price": 0.0},
+            # ITM Long Leg (Back Month)
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_itm_c, "DTE": 60, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0, "Close_Price": 0.0},
+            # ATM Short Leg (Front Month)
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_atm_c, "DTE": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 12.0, "Close_Price": 0.0},
+            # OTM Short Leg (Front Month - Wing / Extra Income)
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_otm_c, "DTE": 30, "IV_%": iv_default, "Qty": -5, "Entry_Price": 5.50, "Close_Price": 0.0},
+            # OTM Put Hedge (Downside Protection)
+            {"Enable": True, "Phase": "Adjustment", "Status": "Open", "Type": "P", "Strike": k_otm_p, "DTE": 30, "IV_%": iv_default, "Qty": 5, "Entry_Price": 4.20, "Close_Price": 0.0},
         ])
-    elif strategy_type == "Diagonal":
-        if option_mode in ["Calls Only", "Both (Call & Put)"]:
-            k_short_c = strike_from_delta("C", 30, S, 30/365, r, iv)
-            k_long_c = strike_from_delta("C", 70, S, 60/365, r, iv)
-            legs.extend([
-                {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_short_c, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 5.50, "Close_Price": 0.0},
-                {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_long_c, "DTE": 60, "Target_Delta": 70, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0, "Close_Price": 0.0},
-            ])
-    elif strategy_type == "Butterfly":
-        k_center_c = strike_from_delta("C", 50, S, 30/365, r, iv)
+    elif strategy_type == "Diagonal Spread":
         legs.extend([
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_center_c - 20, "DTE": 30, "Target_Delta": 65, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0, "Close_Price": 0.0},
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_center_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -20, "Entry_Price": 12.0, "Close_Price": 0.0},
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_center_c + 20, "DTE": 30, "Target_Delta": 35, "IV_%": iv_default, "Qty": 10, "Entry_Price": 4.5, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_itm_c, "DTE": 60, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_otm_c, "DTE": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 5.50, "Close_Price": 0.0},
         ])
-    else:  # Custom / Iron Condor
+    elif strategy_type == "Calendar Spread":
         legs.extend([
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": S - 20, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 4.50, "Close_Price": 0.0},
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": S - 40, "DTE": 30, "Target_Delta": 15, "IV_%": iv_default, "Qty": 10, "Entry_Price": 2.10, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_atm_c, "DTE": 60, "IV_%": iv_default, "Qty": 10, "Entry_Price": 18.5, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_atm_c, "DTE": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 12.0, "Close_Price": 0.0},
+        ])
+    else:  # Blank / Custom Template
+        legs.extend([
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_atm_c, "DTE": 30, "IV_%": iv_default, "Qty": 10, "Entry_Price": 12.0, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": k_atm_p, "DTE": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 11.5, "Close_Price": 0.0},
         ])
 
     return legs
@@ -163,33 +176,25 @@ risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", value=4.5, step=0
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Strategy Selector")
 
-col_strat, col_mode = st.sidebar.columns([1.2, 1])
+strategy_choice = st.sidebar.selectbox(
+    "Preset Template",
+    ["Multi-Leg Combo (ITM/ATM/OTM)", "Diagonal Spread", "Calendar Spread", "Custom / Blank"]
+)
 
-with col_strat:
-    strategy_choice = st.selectbox(
-        "Strategy Type",
-        ["Calendar", "Diagonal", "Butterfly", "Iron Condor", "Custom"]
-    )
-
-with col_mode:
-    option_mode = st.selectbox(
-        "Option Type",
-        ["Calls Only", "Puts Only", "Both (Call & Put)"]
-    )
-
-config_key = f"{strategy_choice}_{option_mode}_{spot_price}"
+config_key = f"{strategy_choice}_{spot_price}"
 if "last_config" not in st.session_state or st.session_state["last_config"] != config_key or st.sidebar.button("Reset Strategy"):
     st.session_state["last_config"] = config_key
-    st.session_state["legs_data"] = build_custom_strategy(strategy_choice, option_mode, spot_price)
+    st.session_state["legs_data"] = build_custom_strategy(strategy_choice, spot_price)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Time Travel & Overlays")
 show_t1 = st.sidebar.checkbox("Show T+1 Line (Morgen)", value=True)
-show_initial_overlay = st.sidebar.checkbox("Overlay 'Initial Trade Only' Curve", value=True)
+show_initial_overlay = st.sidebar.checkbox("Overlay 'Initial Position' Curve", value=True)
 days_forward = st.sidebar.slider("Days Elapsed (Forward in Time)", min_value=0, max_value=60, value=0, step=1)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📝 Portfolio & Adjustment Legs")
+st.sidebar.caption("💡 Füge beliebig viele Legs hinzu (über `+`). Trage bei geschlossenen Legs den `Close_Price` ein.")
 
 legs_df = pd.DataFrame(st.session_state["legs_data"])
 
@@ -212,7 +217,10 @@ edited_df = st.sidebar.data_editor(
 
 
 # --- CALCULATION ENGINE ---
-active_legs = edited_df[edited_df["Enable"] == True] if not edited_df.empty else edited_df
+active_legs = edited_df[edited_df["Enable"] == True].copy() if not edited_df.empty else edited_df.copy()
+
+if not active_legs.empty:
+    active_legs["Moneyness"] = active_legs.apply(lambda r: get_moneyness_label(r["Type"], float(r["Strike"]), spot_price), axis=1)
 
 open_legs = active_legs[active_legs["Status"] == "Open"] if not active_legs.empty else pd.DataFrame()
 closed_legs = active_legs[active_legs["Status"] == "Closed"] if not active_legs.empty else pd.DataFrame()
@@ -305,7 +313,7 @@ if show_initial_overlay and not initial_open.empty:
 
 
 # --- MAIN DASHBOARD LAYOUT ---
-st.title(f"📈 Analytics & Margin Breakdown - {strategy_choice} ({option_mode})")
+st.title(f"📈 Dynamic Multi-Leg Option Analytics ({underlying_symbol})")
 
 # Top KPI Bar - Row 1 (Greeks & PnL)
 m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -320,8 +328,8 @@ st.markdown("---")
 
 # Top KPI Bar - Row 2 (Margin Metrics)
 margin_col1, margin_col2, margin_col3, margin_col4 = st.columns(4)
-margin_col1.metric("Margin Base Position (Calendar)", f"${margin_initial:,.2f}")
-margin_col2.metric("Margin Adjustment", f"${margin_adj:,.2f}", help="Zusätzliche Margin durch Adjustierungs-Legs")
+margin_col1.metric("Margin Base Position", f"${margin_initial:,.2f}")
+margin_col2.metric("Margin Adjustment", f"${margin_adj:,.2f}")
 margin_col3.metric("TOTAL MARGIN REQUIRED", f"${margin_total:,.2f}")
 margin_col4.metric("Margin Return (Theta/Margin)", f"{(tot_theta/margin_total*100 if margin_total > 0 else 0):,.2f}% / Tag")
 
@@ -370,7 +378,7 @@ fig.add_vline(
 )
 
 fig.update_layout(
-    title=f"Risk Chart ONE Style ({underlying_symbol}) - Margin: ${margin_total:,.2f}",
+    title=f"Risk Chart ONE Style ({underlying_symbol}) - Total Margin: ${margin_total:,.2f}",
     xaxis_title=f"Underlying Price ({underlying_symbol})",
     yaxis_title="Total PnL ($)",
     template="plotly_dark",
@@ -381,6 +389,12 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
-# Table display
-st.subheader("📋 Complete Portfolio Legs")
-st.dataframe(edited_df, use_container_width=True)
+# Detailed Multi-Leg Table with ITM/ATM/OTM Breakdown
+st.subheader("📋 Complete Portfolio Legs (with ITM/ATM/OTM Classification)")
+if not active_legs.empty:
+    st.dataframe(
+        active_legs[["Phase", "Status", "Moneyness", "Type", "Strike", "DTE", "IV_%", "Qty", "Entry_Price", "Close_Price"]],
+        use_container_width=True
+    )
+else:
+    st.info("Keine aktiven Beine vorhanden. Verwende das Sidebar-Menü, um welche hinzuzufügen.")
