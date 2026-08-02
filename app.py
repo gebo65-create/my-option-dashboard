@@ -6,7 +6,7 @@ from scipy.stats import norm
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Advanced Strategy Center", 
+    page_title="OptionNet Explorer - Pro Trade Adjustments", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -72,98 +72,49 @@ def strike_from_delta(option_type, target_delta_pct, S, T, r, sigma):
     return round(K / 5.0) * 5.0
 
 def calculate_expected_move(S, iv_pct, dte):
-    """Calculates Expected Move (+/- Points and Upper/Lower Bounds)"""
     T = dte / 365.0
     sigma = iv_pct / 100.0
     em_points = S * sigma * np.sqrt(T)
     return em_points, S - em_points, S + em_points
 
-# --- FLEXIBLE STRATEGY BUILDER ---
+# --- FLEXIBLE STRATEGY BUILDER WITH ADJUSTMENT FIELDS ---
 def build_custom_strategy(strategy_type, option_mode, S, iv_default=18.0):
     iv = iv_default / 100.0
     r = 0.045
     legs = []
     
-    # 1. CALENDAR SPREAD
-    if strategy_type == "Calendar":
-        if option_mode in ["Calls Only", "Both (Call & Put)"]:
-            k_c = strike_from_delta("C", 50, S, 30/365, r, iv)
-            legs.extend([
-                {"Enable": True, "Type": "C", "Strike": k_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -10, "Entry_Price": 12.0},
-                {"Enable": True, "Type": "C", "Strike": k_c, "DTE": 60, "Target_Delta": 50, "IV_%": iv_default, "Qty": 10, "Entry_Price": 18.5},
-            ])
-        if option_mode in ["Puts Only", "Both (Call & Put)"]:
-            k_p = strike_from_delta("P", 50, S, 30/365, r, iv)
-            legs.extend([
-                {"Enable": True, "Type": "P", "Strike": k_p, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -10, "Entry_Price": 11.5},
-                {"Enable": True, "Type": "P", "Strike": k_p, "DTE": 60, "Target_Delta": 50, "IV_%": iv_default, "Qty": 10, "Entry_Price": 17.8},
-            ])
-
-    # 2. DIAGONAL SPREAD
-    elif strategy_type == "Diagonal":
+    if strategy_type == "Diagonal":
         if option_mode in ["Calls Only", "Both (Call & Put)"]:
             k_short_c = strike_from_delta("C", 30, S, 30/365, r, iv)
             k_long_c = strike_from_delta("C", 70, S, 60/365, r, iv)
             legs.extend([
-                {"Enable": True, "Type": "C", "Strike": k_short_c, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 5.50},
-                {"Enable": True, "Type": "C", "Strike": k_long_c, "DTE": 60, "Target_Delta": 70, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0},
+                {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_short_c, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 5.50, "Close_Price": 0.0},
+                {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_long_c, "DTE": 60, "Target_Delta": 70, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0, "Close_Price": 0.0},
             ])
         if option_mode in ["Puts Only", "Both (Call & Put)"]:
             k_short_p = strike_from_delta("P", 30, S, 30/365, r, iv)
             k_long_p = strike_from_delta("P", 70, S, 60/365, r, iv)
             legs.extend([
-                {"Enable": True, "Type": "P", "Strike": k_short_p, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 6.20},
-                {"Enable": True, "Type": "P", "Strike": k_long_p, "DTE": 60, "Target_Delta": 70, "IV_%": iv_default, "Qty": 10, "Entry_Price": 24.5},
+                {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": k_short_p, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 6.20, "Close_Price": 0.0},
+                {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": k_long_p, "DTE": 60, "Target_Delta": 70, "IV_%": iv_default, "Qty": 10, "Entry_Price": 24.5, "Close_Price": 0.0},
             ])
-
-    # 3. BUTTERFLY
-    elif strategy_type == "Butterfly":
-        if option_mode in ["Calls Only", "Both (Call & Put)"]:
-            k_center_c = strike_from_delta("C", 50, S, 30/365, r, iv)
-            legs.extend([
-                {"Enable": True, "Type": "C", "Strike": k_center_c - 20, "DTE": 30, "Target_Delta": 65, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0},
-                {"Enable": True, "Type": "C", "Strike": k_center_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -20, "Entry_Price": 12.0},
-                {"Enable": True, "Type": "C", "Strike": k_center_c + 20, "DTE": 30, "Target_Delta": 35, "IV_%": iv_default, "Qty": 10, "Entry_Price": 4.5},
-            ])
-        if option_mode in ["Puts Only", "Both (Call & Put)"]:
-            k_center_p = strike_from_delta("P", 50, S, 30/365, r, iv)
-            legs.extend([
-                {"Enable": True, "Type": "P", "Strike": k_center_p - 20, "DTE": 30, "Target_Delta": 35, "IV_%": iv_default, "Qty": 10, "Entry_Price": 4.0},
-                {"Enable": True, "Type": "P", "Strike": k_center_p, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -20, "Entry_Price": 11.5},
-                {"Enable": True, "Type": "P", "Strike": k_center_p + 20, "DTE": 30, "Target_Delta": 65, "IV_%": iv_default, "Qty": 10, "Entry_Price": 21.0},
-            ])
-
-    # 4. BROKEN WING BUTTERFLY (BWB)
-    elif strategy_type == "Broken Wing Butterfly":
-        if option_mode in ["Calls Only", "Both (Call & Put)"]:
-            k_center_c = strike_from_delta("C", 40, S, 30/365, r, iv)
-            legs.extend([
-                {"Enable": True, "Type": "C", "Strike": k_center_c - 15, "DTE": 30, "Target_Delta": 55, "IV_%": iv_default, "Qty": 10, "Entry_Price": 16.0},
-                {"Enable": True, "Type": "C", "Strike": k_center_c, "DTE": 30, "Target_Delta": 40, "IV_%": iv_default, "Qty": -20, "Entry_Price": 8.5},
-                {"Enable": True, "Type": "C", "Strike": k_center_c + 30, "DTE": 30, "Target_Delta": 20, "IV_%": iv_default, "Qty": 10, "Entry_Price": 2.2},
-            ])
-        if option_mode in ["Puts Only", "Both (Call & Put)"]:
-            k_center_p = strike_from_delta("P", 40, S, 30/365, r, iv)
-            legs.extend([
-                {"Enable": True, "Type": "P", "Strike": k_center_p - 30, "DTE": 30, "Target_Delta": 20, "IV_%": iv_default, "Qty": 10, "Entry_Price": 2.5},
-                {"Enable": True, "Type": "P", "Strike": k_center_p, "DTE": 30, "Target_Delta": 40, "IV_%": iv_default, "Qty": -20, "Entry_Price": 8.8},
-                {"Enable": True, "Type": "P", "Strike": k_center_p + 15, "DTE": 30, "Target_Delta": 55, "IV_%": iv_default, "Qty": 10, "Entry_Price": 15.5},
-            ])
-
-    # 5. IRON CONDOR
-    elif strategy_type == "Iron Condor":
+    elif strategy_type == "Calendar":
+        k_c = strike_from_delta("C", 50, S, 30/365, r, iv)
         legs.extend([
-            {"Enable": True, "Type": "P", "Strike": S - 40, "DTE": 30, "Target_Delta": 15, "IV_%": iv_default, "Qty": 10, "Entry_Price": 2.10},
-            {"Enable": True, "Type": "P", "Strike": S - 20, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 4.50},
-            {"Enable": True, "Type": "C", "Strike": S + 20, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 2.50},
-            {"Enable": True, "Type": "C", "Strike": S + 40, "DTE": 30, "Target_Delta": 15, "IV_%": iv_default, "Qty": 10, "Entry_Price": 1.10},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -10, "Entry_Price": 12.0, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_c, "DTE": 60, "Target_Delta": 50, "IV_%": iv_default, "Qty": 10, "Entry_Price": 18.5, "Close_Price": 0.0},
         ])
-
-    # 6. CUSTOM
-    else:
+    elif strategy_type == "Butterfly":
+        k_center_c = strike_from_delta("C", 50, S, 30/365, r, iv)
         legs.extend([
-            {"Enable": True, "Type": "P", "Strike": S - 20, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 4.50},
-            {"Enable": True, "Type": "P", "Strike": S - 40, "DTE": 30, "Target_Delta": 15, "IV_%": iv_default, "Qty": 10, "Entry_Price": 2.10},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_center_c - 20, "DTE": 30, "Target_Delta": 65, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_center_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -20, "Entry_Price": 12.0, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_center_c + 20, "DTE": 30, "Target_Delta": 35, "IV_%": iv_default, "Qty": 10, "Entry_Price": 4.5, "Close_Price": 0.0},
+        ])
+    else:  # Custom / Iron Condor / BWB
+        legs.extend([
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": S - 20, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 4.50, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": S - 40, "DTE": 30, "Target_Delta": 15, "IV_%": iv_default, "Qty": 10, "Entry_Price": 2.10, "Close_Price": 0.0},
         ])
 
     return legs
@@ -184,13 +135,13 @@ col_strat, col_mode = st.sidebar.columns([1.2, 1])
 with col_strat:
     strategy_choice = st.selectbox(
         "Strategy Type",
-        ["Calendar", "Diagonal", "Butterfly", "Broken Wing Butterfly", "Iron Condor", "Custom"]
+        ["Diagonal", "Calendar", "Butterfly", "Broken Wing Butterfly", "Iron Condor", "Custom"]
     )
 
 with col_mode:
     option_mode = st.selectbox(
         "Option Type",
-        ["Puts Only", "Calls Only", "Both (Call & Put)"]
+        ["Calls Only", "Puts Only", "Both (Call & Put)"]
     )
 
 config_key = f"{strategy_choice}_{option_mode}_{spot_price}"
@@ -203,7 +154,8 @@ st.sidebar.subheader("📅 Time Travel (T+X Days)")
 days_forward = st.sidebar.slider("Days Elapsed (Forward in Time)", min_value=0, max_value=60, value=0, step=1)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("📝 Legs Configuration & Delta")
+st.sidebar.subheader("📝 Portfolio & Adjustment Legs")
+st.sidebar.info("💡 **Adjustierung:** Setze `Status` auf `Closed` und trage den `Close_Price` ein. Füge über `+` neue Legs als `Adjustment` hinzu.")
 
 legs_df = pd.DataFrame(st.session_state["legs_data"])
 
@@ -212,24 +164,38 @@ edited_df = st.sidebar.data_editor(
     num_rows="dynamic",
     column_config={
         "Enable": st.column_config.CheckboxColumn("Active?", default=True),
+        "Phase": st.column_config.SelectboxColumn("Phase", options=["Initial", "Adjustment"], default="Initial"),
+        "Status": st.column_config.SelectboxColumn("Status", options=["Open", "Closed"], default="Open"),
         "Type": st.column_config.SelectboxColumn("Type", options=["C", "P"], required=True),
         "Strike": st.column_config.NumberColumn("Strike", min_value=1.0, step=5.0),
         "DTE": st.column_config.NumberColumn("DTE", min_value=1, step=1),
-        "Target_Delta": st.column_config.NumberColumn("Delta (1-99)", min_value=1, max_value=99, step=1),
         "IV_%": st.column_config.NumberColumn("IV %", min_value=1.0, max_value=300.0, step=0.5),
         "Qty": st.column_config.NumberColumn("Qty (+/-)", step=1),
         "Entry_Price": st.column_config.NumberColumn("Entry ($)", step=0.05),
+        "Close_Price": st.column_config.NumberColumn("Close ($)", step=0.05),
     }
 )
 
 
-# --- CALCULATION ENGINE ---
+# --- CALCULATION ENGINE WITH REALIZED PNL ---
 active_legs = edited_df[edited_df["Enable"] == True] if not edited_df.empty else edited_df
 
-# Calculate Expected Move for active legs
-if not active_legs.empty:
-    avg_iv = active_legs["IV_%"].mean()
-    min_dte = active_legs["DTE"].min()
+open_legs = active_legs[active_legs["Status"] == "Open"] if not active_legs.empty else pd.DataFrame()
+closed_legs = active_legs[active_legs["Status"] == "Closed"] if not active_legs.empty else pd.DataFrame()
+
+# 1. Calculate Realized PnL from Closed Legs
+realized_pnl = 0.0
+if not closed_legs.empty:
+    for _, row in closed_legs.iterrows():
+        entry = float(row["Entry_Price"])
+        close_p = float(row["Close_Price"])
+        qty = float(row["Qty"])
+        realized_pnl += (close_p - entry) * qty * 100.0
+
+# 2. Calculate Expected Move (based on open legs)
+if not open_legs.empty:
+    avg_iv = open_legs["IV_%"].mean()
+    min_dte = open_legs["DTE"].min()
     em_pts, em_lower, em_upper = calculate_expected_move(spot_price, avg_iv, min_dte)
 else:
     em_pts, em_lower, em_upper = 0.0, spot_price, spot_price
@@ -242,14 +208,16 @@ x_min = min(spot_price * 0.85, min_strike * 0.90, em_lower * 0.95)
 x_max = max(spot_price * 1.15, max_strike * 1.10, em_upper * 1.05)
 spot_range = np.linspace(x_min, x_max, 500)
 
-pnl_exp = np.zeros_like(spot_range)
-pnl_t0 = np.zeros_like(spot_range)
-pnl_tx = np.zeros_like(spot_range)
+# Base PnL initialized with Realized PnL from closed positions
+pnl_exp = np.full_like(spot_range, realized_pnl)
+pnl_t0 = np.full_like(spot_range, realized_pnl)
+pnl_tx = np.full_like(spot_range, realized_pnl)
 
 tot_delta, tot_gamma, tot_theta, tot_vega = 0.0, 0.0, 0.0, 0.0
 
-if not active_legs.empty:
-    for _, row in active_legs.iterrows():
+# 3. Add Unrealized PnL and Greeks from Open Legs
+if not open_legs.empty:
+    for _, row in open_legs.iterrows():
         opt_type = str(row["Type"])
         strike = float(row["Strike"])
         dte = float(row["DTE"])
@@ -261,19 +229,19 @@ if not active_legs.empty:
         t_t0 = max(0.00001, dte / 365.0)
         t_tx = max(0.00001, (dte - days_forward) / 365.0)
         
-        # 1. PnL at Expiration
+        # Expiration PnL
         exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
         pnl_exp += (exp_prices - entry) * qty * 100.0
         
-        # 2. PnL at T+0 (Today)
+        # T+0 PnL
         t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
         pnl_t0 += (t0_prices - entry) * qty * 100.0
         
-        # 3. PnL at T+X (Elapsed Days)
+        # T+X PnL
         tx_prices = np.array([bs_price(opt_type, s, strike, t_tx, risk_free_rate, iv) for s in spot_range])
         pnl_tx += (tx_prices - entry) * qty * 100.0
         
-        # Net Greeks calculation
+        # Greeks (Only active for Open legs!)
         greeks = bs_greeks(opt_type, spot_price, strike, t_tx, risk_free_rate, iv)
         tot_delta += greeks['delta'] * qty * 100.0
         tot_gamma += greeks['gamma'] * qty * 100.0
@@ -282,35 +250,36 @@ if not active_legs.empty:
 
 
 # --- MAIN DASHBOARD LAYOUT ---
-st.title(f"📈 Option Analytics - {strategy_choice} ({option_mode})")
+st.title(f"📈 Combined Position Analytics - {strategy_choice} ({option_mode})")
 
-# Top KPI Bar (Greeks & Expected Move)
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-kpi1.metric("Net Delta", f"{tot_delta:,.2f}")
-kpi2.metric("Net Gamma", f"{tot_gamma:,.4f}")
-kpi3.metric("Net Theta ($/Tag)", f"{tot_theta:,.2f}")
-kpi4.metric("Net Vega", f"{tot_vega:,.2f}")
-kpi5.metric(f"Expected Move ({min_dte} DTE)", f"±{em_pts:,.2f} pts", f"{em_lower:,.1f} - {em_upper:,.1f}")
+# Top KPI Bar
+kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+kpi1.metric("Realized PnL", f"${realized_pnl:,.2f}", delta_color="normal")
+kpi2.metric("Net Delta", f"{tot_delta:,.2f}")
+kpi3.metric("Net Gamma", f"{tot_gamma:,.4f}")
+kpi4.metric("Net Theta ($/Tag)", f"{tot_theta:,.2f}")
+kpi5.metric("Net Vega", f"{tot_vega:,.2f}")
+kpi6.metric(f"Expected Move ({min_dte} DTE)", f"±{em_pts:,.2f} pts", f"{em_lower:,.1f} - {em_upper:,.1f}")
 
 st.markdown("---")
 
 # Plotly High-Precision Risk Chart
 fig = go.Figure()
 
-# Expiration Line
+# Expiration Line (Total Combined)
 fig.add_trace(go.Scatter(
-    x=spot_range, y=pnl_exp, mode='lines', name='Expiration PnL', line=dict(color='#29b6f6', width=2.5)
+    x=spot_range, y=pnl_exp, mode='lines', name='Total Expiration PnL', line=dict(color='#29b6f6', width=2.5)
 ))
 
-# T+0 Line
+# T+0 Line (Total Combined)
 fig.add_trace(go.Scatter(
-    x=spot_range, y=pnl_t0, mode='lines', name='T+0 (Heute)', line=dict(color='#ff5252', width=2.5)
+    x=spot_range, y=pnl_t0, mode='lines', name='Total T+0 (Heute)', line=dict(color='#ff5252', width=2.5)
 ))
 
 # T+X Line
 if days_forward > 0:
     fig.add_trace(go.Scatter(
-        x=spot_range, y=pnl_tx, mode='lines', name=f'T+{days_forward} Tage', line=dict(color='#ffa726', width=2, dash='dash')
+        x=spot_range, y=pnl_tx, mode='lines', name=f'Total T+{days_forward} Tage', line=dict(color='#ffa726', width=2, dash='dash')
     ))
 
 # Zero Baseline
@@ -322,7 +291,7 @@ fig.add_vline(
     annotation_text=f" Spot: {spot_price}", annotation_position="top right"
 )
 
-# Expected Move Lines (ONE Style)
+# Expected Move Lines
 fig.add_vline(
     x=em_lower, line_dash="dash", line_color="#ab47bc", line_width=1.5,
     annotation_text=f"-EM: {em_lower:,.1f}", annotation_position="bottom left"
@@ -333,9 +302,9 @@ fig.add_vline(
 )
 
 fig.update_layout(
-    title=f"Risk Chart ({underlying_symbol}) - {strategy_choice} ({option_mode})",
+    title=f"Combined Risk Chart (Includes Realized PnL: ${realized_pnl:,.2f})",
     xaxis_title=f"Underlying Price ({underlying_symbol})",
-    yaxis_title="PnL ($)",
+    yaxis_title="Total PnL ($)",
     template="plotly_dark",
     height=550,
     hovermode="x unified",
@@ -345,5 +314,5 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # Table display
-st.subheader("📋 Active Legs Overview")
+st.subheader("📋 Complete Portfolio Legs (Initial & Adjustments)")
 st.dataframe(edited_df, use_container_width=True)
