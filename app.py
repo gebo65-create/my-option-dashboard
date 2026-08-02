@@ -155,20 +155,18 @@ def calculate_phase_margin(legs_subset, spot_price):
             
     return round(total_margin, 2)
 
-# --- OPTION CHAIN BUILDER (JETZT MIT DYNAMISCHEN STRIKE-SCHRITTEN) ---
-def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=1.0, num_strikes=17):
+# --- OPTION CHAIN BUILDER (MIT ITM / INTRINSIC VALUE & FARB-LOGIK) ---
+def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=1.0, num_strikes=21):
     T = max(0.00001, dte / 365.0)
     atm_strike = round(spot / strike_step) * strike_step
     half_strikes = num_strikes // 2
     
-    ordered_strikes = [atm_strike]
-    for i in range(1, half_strikes + 1):
-        ordered_strikes.append(round(atm_strike + i * strike_step, 2))
-        ordered_strikes.append(round(atm_strike - i * strike_step, 2))
-        
+    # Sortierte Liste von Strikes (von tief nach hoch)
+    strikes = [round(atm_strike + i * strike_step, 2) for i in range(-half_strikes, half_strikes + 1)]
+    
     chain = []
     
-    for K in ordered_strikes:
+    for K in strikes:
         moneyness = np.log(K / spot)
         skew_iv = base_iv - (moneyness * 12.0) + (moneyness**2 * 20.0)
         sigma = max(0.05, skew_iv / 100.0)
@@ -179,10 +177,21 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=1.0, num
         p_price = bs_price('P', spot, K, T, r, sigma)
         p_greeks = bs_greeks('P', spot, K, T, r, sigma)
         
+        # In-The-Money Berechnungen
+        call_itm = K < spot
+        put_itm = K > spot
         is_atm = (abs(K - atm_strike) < 0.001)
         
+        c_intrinsic = max(0.0, spot - K)
+        c_extrinsic = max(0.0, c_price - c_intrinsic)
+        
+        p_intrinsic = max(0.0, K - spot)
+        p_extrinsic = max(0.0, p_price - p_intrinsic)
+        
         chain.append({
-            "ATM_Marker": "🎯 ATM" if is_atm else "",
+            "C_ITM": call_itm,
+            "C_Intrinsic": round(c_intrinsic, 2),
+            "C_Extrinsic": round(c_extrinsic, 2),
             "C_Theta": round(c_greeks['theta'], 2),
             "C_Gamma": round(c_greeks['gamma'], 4),
             "C_Delta": round(c_greeks['delta'], 2),
@@ -190,22 +199,46 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=1.0, num
             "C_Bid": round(c_price * 0.98, 2),
             "C_Ask": round(c_price * 1.02, 2),
             "STRIKE": float(K),
+            "ATM_Marker": "🎯 ATM" if is_atm else "",
             "P_Ask": round(p_price * 1.02, 2),
             "P_Bid": round(p_price * 0.98, 2),
             "P_IV_%": round(skew_iv, 1),
             "P_Delta": round(p_greeks['delta'], 2),
             "P_Gamma": round(p_greeks['gamma'], 4),
             "P_Theta": round(p_greeks['theta'], 2),
+            "P_Intrinsic": round(p_intrinsic, 2),
+            "P_Extrinsic": round(p_extrinsic, 2),
+            "P_ITM": put_itm,
             "IS_ATM": is_atm
         })
         
     return pd.DataFrame(chain)
 
-def highlight_atm(row):
-    if row.get("IS_ATM", False):
+# Custom Styling für ITM & ATM Hervorhebung
+def highlight_option_chain(row):
+    styles = [''] * len(row)
+    is_atm = row.get("IS_ATM", False)
+    c_itm = row.get("C_ITM", False)
+    p_itm = row.get("P_ITM", False)
+    
+    if is_atm:
         return ['background-color: #8b0000; color: white; font-weight: bold;'] * len(row)
-    else:
-        return [''] * len(row)
+    
+    # Indizes für Call Spalten (links) und Put Spalten (rechts)
+    call_cols_idx = [i for i, col in enumerate(row.index) if col.startswith("C_")]
+    put_cols_idx = [i for i, col in enumerate(row.index) if col.startswith("P_")]
+    
+    # Farbschema für ITM Calls (Dunkelblau/Cyan Hintergrund)
+    if c_itm:
+        for idx in call_cols_idx:
+            styles[idx] = 'background-color: #1a365d; color: #90caf9;'
+            
+    # Farbschema für ITM Puts (Dunkelgrün/Teal Hintergrund)
+    if p_itm:
+        for idx in put_cols_idx:
+            styles[idx] = 'background-color: #1b4332; color: #a7f3d0;'
+            
+    return styles
 
 # --- LIVE SPOT DATA ---
 TICKER_MAP = {
@@ -584,7 +617,7 @@ with c2:
     st.caption(f"Datum B: `{dt2.strftime('%Y-%m-%d')}` | Status: {get_market_status(dt2)}")
 
 with c3:
-    num_strikes_view = st.slider("Anzahl Strikes anzeigen", 11, 35, 19, step=2)
+    num_strikes_view = st.slider("Anzahl Strikes anzeigen", 11, 51, 21, step=2)
 
 chain_df_1 = build_classic_option_chain(spot_price, selected_dte_1, base_iv, r=risk_free_rate, strike_step=strike_step_val, num_strikes=num_strikes_view)
 chain_df_2 = build_classic_option_chain(spot_price, selected_dte_2, base_iv, r=risk_free_rate, strike_step=strike_step_val, num_strikes=num_strikes_view)
@@ -593,20 +626,24 @@ tab_chain1, tab_comp = st.tabs([f"🏛️ Option Chain (DTE {selected_dte_1})", 
 
 with tab_chain1:
     st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) — Spot @ `{spot_price}` (Schrittweite: `{strike_step_val}`)**")
+    st.caption("🟦 **Blau hinterlegt:** ITM Calls ($K < \\text{Spot}$) | 🟩 **Grün hinterlegt:** ITM Puts ($K > \\text{Spot}$) | 🟥 **Rot:** ATM Strike")
     
-    styled_df_1 = chain_df_1.style.apply(highlight_atm, axis=1).hide(axis="columns", subset=["IS_ATM"])
+    # Auszublendende Hilfs-Spalten für den Render-DataFrame
+    cols_to_hide = ["C_ITM", "P_ITM", "IS_ATM"]
+    
+    styled_df_1 = chain_df_1.style.apply(highlight_option_chain, axis=1).hide(axis="columns", subset=cols_to_hide)
     
     st.dataframe(
         styled_df_1,
         use_container_width=True,
-        height=500
+        height=550
     )
 
 with tab_comp:
     st.markdown(f"**Direktvergleich: DTE {selected_dte_1} vs. DTE {selected_dte_2} (Schrittweite: `{strike_step_val}`)**")
     
     comp_merged = pd.merge(
-        chain_df_1[["STRIKE", "ATM_Marker", "IS_ATM", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
+        chain_df_1[["STRIKE", "ATM_Marker", "IS_ATM", "C_ITM", "P_ITM", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
         chain_df_2[["STRIKE", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
         on="STRIKE",
         suffixes=(f" (DTE {selected_dte_1})", f" (DTE {selected_dte_2})")
@@ -617,10 +654,11 @@ with tab_comp:
     comp_merged["Call Price Diff ($)"] = round(comp_merged[f"C_Ask (DTE {selected_dte_2})"] - comp_merged[f"C_Ask (DTE {selected_dte_1})"], 2)
     comp_merged["Put Price Diff ($)"] = round(comp_merged[f"P_Ask (DTE {selected_dte_2})"] - comp_merged[f"P_Ask (DTE {selected_dte_1})"], 2)
 
-    styled_comp = comp_merged.style.apply(highlight_atm, axis=1).hide(axis="columns", subset=["IS_ATM"])
+    cols_to_hide_comp = ["C_ITM", "P_ITM", "IS_ATM"]
+    styled_comp = comp_merged.style.apply(highlight_option_chain, axis=1).hide(axis="columns", subset=cols_to_hide_comp)
 
     st.dataframe(
         styled_comp,
         use_container_width=True,
-        height=500
+        height=550
     )
