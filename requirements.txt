@@ -4,4 +4,4 @@ pandas
 plotly
 scipy
 yfinance
-ib-insync
+ib-async
