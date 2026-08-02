@@ -1,3 +1,12 @@
+import asyncio
+
+# --- EVENT LOOP FIX FÜR STREAMLIT / PYTHON 3.10+ ---
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -6,12 +15,16 @@ from scipy.stats import norm
 import yfinance as yf
 from datetime import datetime
 
-# Versuche ib_insync zu importieren (falls installiert)
+# Versuche ib_async (bevorzugt) oder ib_insync zu importieren
 try:
-    from ib_insync import IB, Option, util
+    from ib_async import IB, Option, util
     IBKR_AVAILABLE = True
 except ImportError:
-    IBKR_AVAILABLE = False
+    try:
+        from ib_insync import IB, Option, util
+        IBKR_AVAILABLE = True
+    except ImportError:
+        IBKR_AVAILABLE = False
 
 # Page Configuration
 st.set_page_config(
@@ -134,7 +147,7 @@ def generate_dte_iv_table(spot_price, base_iv, r=0.045):
 # --- IBKR POSITIONS IMPORT ENGINE ---
 def fetch_ibkr_positions(host='127.0.0.1', port=7497, client_id=1):
     if not IBKR_AVAILABLE:
-        st.error("Das Paket 'ib_insync' ist nicht installiert. Bitte 'pip install ib-insync' ausführen.")
+        st.error("Weder 'ib_async' noch 'ib_insync' ist installiert. Bitte 'pip install ib-async' ausführen.")
         return None
         
     ib = IB()
@@ -147,9 +160,7 @@ def fetch_ibkr_positions(host='127.0.0.1', port=7497, client_id=1):
         
         for pos in positions:
             contract = pos.contract
-            # Nur Optionskontrakte filtern
             if contract.secType == 'OPT':
-                # DTE Berechnung
                 exp_date = datetime.strptime(contract.lastTradeDateOrContractMonth, "%Y%m%d").date()
                 dte = max(0, (exp_date - today).days)
                 
@@ -162,7 +173,7 @@ def fetch_ibkr_positions(host='127.0.0.1', port=7497, client_id=1):
                     "Type": "C" if contract.right == "C" or contract.right == "CALL" else "P",
                     "Strike": float(contract.strike),
                     "DTE": int(dte),
-                    "IV_%": 18.0, # Standardwert (kann angepasst werden)
+                    "IV_%": 18.0,
                     "Qty": int(pos.position),
                     "Entry_Price": entry_price
                 })
@@ -370,7 +381,6 @@ fig.add_trace(go.Scatter(
 fig.add_hline(y=0, line_dash="solid", line_color="#455a64", line_width=1)
 fig.add_vline(x=spot_price, line_dash="dot", line_color="#ffffff", line_width=1.5)
 
-# T+0 Marker Annotation am Spot Price
 fig.add_annotation(
     x=spot_price, y=spot_pnl_t0,
     text=f" <b>T+0 Spot: ${spot_pnl_t0:,.2f}</b>",
@@ -378,7 +388,6 @@ fig.add_annotation(
     bgcolor="#ff5252", bordercolor="#ffffff", font=dict(color="white", size=11)
 )
 
-# T+1 Marker Annotation am Spot Price
 fig.add_annotation(
     x=spot_price, y=spot_pnl_t1,
     text=f" <b>T+1 Spot: ${spot_pnl_t1:,.2f}</b>",
