@@ -28,7 +28,7 @@ except ImportError:
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Full Chain & Risk Graph", 
+    page_title="OptionNet Explorer - Full Chain, Risk & Margin", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -119,7 +119,42 @@ def bs_greeks(option_type, S, K, T, r, sigma):
     
     return {'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega}
 
-# --- OPTION CHAIN BUILDER (OPTIONNET EXPLORER STYLE) ---
+# --- MARGIN CALCULATION HELPER ---
+def calculate_phase_margin(legs_subset, spot_price):
+    if legs_subset.empty:
+        return 0.0
+    
+    total_margin = 0.0
+    for _, row in legs_subset.iterrows():
+        try:
+            qty = float(row["Qty"])
+            strike = float(row["Strike"])
+            opt_type = str(row["Type"])
+            entry = float(row["Entry_Price"])
+            
+            # Nur Short-Positionen erfordern explizite Margin nach Standard-Regeln
+            if qty < 0:
+                abs_qty = abs(qty)
+                if opt_type == 'P':
+                    otm_amount = max(0.0, spot_price - strike)
+                    reg_t_margin = (0.20 * spot_price - otm_amount + entry) * 100.0 * abs_qty
+                    min_margin = (0.10 * strike + entry) * 100.0 * abs_qty
+                    leg_margin = max(reg_t_margin, min_margin)
+                else: # Call
+                    otm_amount = max(0.0, strike - spot_price)
+                    reg_t_margin = (0.20 * spot_price - otm_amount + entry) * 100.0 * abs_qty
+                    min_margin = (0.10 * spot_price + entry) * 100.0 * abs_qty
+                    leg_margin = max(reg_t_margin, min_margin)
+                total_margin += leg_margin
+            else:
+                # Long Option: Margin ist die gezahlte Prämie
+                total_margin += (entry * 100.0 * qty)
+        except (ValueError, KeyError):
+            continue
+            
+    return round(total_margin, 2)
+
+# --- OPTION CHAIN BUILDER ---
 def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_strikes=17):
     T = max(0.00001, dte / 365.0)
     atm_strike = round(spot / strike_step) * strike_step
@@ -130,7 +165,6 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_s
     
     for K in strikes:
         moneyness = np.log(K / spot)
-        # Volatility Skew (Put IV gewichtet höher bei OTM Puts)
         skew_iv = base_iv - (moneyness * 12.0) + (moneyness**2 * 20.0)
         sigma = max(0.05, skew_iv / 100.0)
         
@@ -196,10 +230,15 @@ spot_price = st.sidebar.number_input(
 base_iv = st.sidebar.number_input("Base IV (%)", value=18.0, step=0.5)
 risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", value=4.5, step=0.1) / 100.0
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🛡️ Display Options")
+show_margin = st.sidebar.checkbox("Margin Details anzeigen", value=True)
+
 def get_default_legs(current_spot, current_iv):
     return [
         {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": round(current_spot, -1), "DTE": 30, "IV_%": current_iv, "Qty": 10, "Entry_Price": round(current_spot * 0.02, 2)},
         {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(current_spot * 0.95, -1), "DTE": 30, "IV_%": current_iv, "Qty": -10, "Entry_Price": round(current_spot * 0.01, 2)},
+        {"Enable": True, "Phase": "Adjustment", "Type": "P", "Strike": round(current_spot * 0.90, -1), "DTE": 20, "IV_%": current_iv + 2, "Qty": -5, "Entry_Price": round(current_spot * 0.008, 2)},
     ]
 
 if "last_symbol" not in st.session_state:
@@ -243,6 +282,14 @@ st.session_state["legs_df"] = edited_df
 
 # --- PNL & RISK CALCULATION ---
 active_legs = edited_df[edited_df["Enable"] == True].copy() if not edited_df.empty else pd.DataFrame()
+
+# Separate Phasen für Margin
+initial_legs = active_legs[active_legs["Phase"] == "Initial"] if not active_legs.empty else pd.DataFrame()
+adj_legs = active_legs[active_legs["Phase"] == "Adjustment"] if not active_legs.empty else pd.DataFrame()
+
+margin_initial = calculate_phase_margin(initial_legs, spot_price)
+margin_adj = calculate_phase_margin(adj_legs, spot_price)
+margin_total = calculate_phase_margin(active_legs, spot_price)
 
 if not active_legs.empty and "Strike" in active_legs and len(active_legs["Strike"].dropna()) > 0:
     min_strike = active_legs["Strike"].min()
@@ -300,17 +347,41 @@ if not active_legs.empty:
 # --- MAIN WORKSPACE ---
 st.title(f"📈 OptionNet Explorer Professional ({underlying_symbol})")
 
-# Top KPI Header
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("PnL T+0 (Heute)", f"${spot_pnl_t0:,.2f}")
-m2.metric("PnL T+1 (Morgen)", f"${spot_pnl_t1:,.2f}", f"${(spot_pnl_t1 - spot_pnl_t0):,.2f}")
-m3.metric("Position Delta", f"{tot_delta:,.2f}")
-m4.metric("Position Theta ($/Tag)", f"{tot_theta:,.2f}")
-m5.metric("Position Vega", f"{tot_vega:,.2f}")
+# Dynamische KPI Spaltenanzahl je nach Margin Toggle
+if show_margin:
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("PnL T+0 (Heute)", f"${spot_pnl_t0:,.2f}")
+    m2.metric("PnL T+1 (Morgen)", f"${spot_pnl_t1:,.2f}", f"${(spot_pnl_t1 - spot_pnl_t0):,.2f}")
+    m3.metric("Position Delta", f"{tot_delta:,.2f}")
+    m4.metric("Position Theta", f"${tot_theta:,.2f}")
+    m5.metric("Position Vega", f"{tot_vega:,.2f}")
+    m6.metric("Gesamt Margin", f"${margin_total:,.2f}")
+else:
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("PnL T+0 (Heute)", f"${spot_pnl_t0:,.2f}")
+    m2.metric("PnL T+1 (Morgen)", f"${spot_pnl_t1:,.2f}", f"${(spot_pnl_t1 - spot_pnl_t0):,.2f}")
+    m3.metric("Position Delta", f"{tot_delta:,.2f}")
+    m4.metric("Position Theta", f"${tot_theta:,.2f}")
+    m5.metric("Position Vega", f"{tot_vega:,.2f}")
 
 st.markdown("---")
 
-# SECTION 1: RISK GRAPH
+# SECTION 1: MARGIN OVERVIEW PANEL (NUR WENN EIN GESCHALTET)
+if show_margin:
+    st.subheader("💵 Margin Breakdown (Original vs. Adjustiert)")
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    
+    col_m1.metric("Initial Margin (Original)", f"${margin_initial:,.2f}")
+    col_m2.metric("Adjustment Margin", f"${margin_adj:,.2f}")
+    col_m3.metric("Gesamt Margin", f"${margin_total:,.2f}")
+    
+    # Return on Margin Berechnen
+    rom_t0 = (spot_pnl_t0 / margin_total * 100.0) if margin_total > 0 else 0.0
+    col_m4.metric("Return on Margin (T+0)", f"{rom_t0:.2f}%")
+    
+    st.markdown("---")
+
+# SECTION 2: RISK GRAPH
 st.subheader("📉 Risk Profile Graph")
 
 fig = go.Figure()
@@ -333,7 +404,7 @@ st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
 
-# SECTION 2: CLASSIC OPTION CHAIN & DTE COMPARISON
+# SECTION 3: CLASSIC OPTION CHAIN & DTE COMPARISON
 st.subheader("⛓️ Option Chain & Multi-DTE Analysis")
 
 c1, c2, c3 = st.columns([1, 1, 2])
@@ -353,7 +424,7 @@ with c3:
 chain_df_1 = build_classic_option_chain(spot_price, selected_dte_1, base_iv, r=risk_free_rate, num_strikes=num_strikes_view)
 chain_df_2 = build_classic_option_chain(spot_price, selected_dte_2, base_iv, r=risk_free_rate, num_strikes=num_strikes_view)
 
-tab_chain1, tab_comp = st.tabs([f"🏛️ Option Chain (DTE {selected_dte_1})", f"⚔️ DTE {selected_dte_1} vs DTE {selected_dte_2} IV/Price Difference Matrix"])
+tab_chain1, tab_comp = st.tabs([f"🏛️ Option Chain (DTE {selected_dte_1})", f"⚔️ DTE {selected_dte_1} vs DTE {selected_dte_2} Matrix"])
 
 with tab_chain1:
     st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) - Spot @ `{spot_price}`**")
