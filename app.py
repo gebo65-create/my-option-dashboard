@@ -28,7 +28,7 @@ except ImportError:
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Calendar & US Holidays", 
+    page_title="OptionNet Explorer - Chain & DTE Comparison", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -119,18 +119,38 @@ def bs_greeks(option_type, S, K, T, r, sigma):
     
     return {'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega}
 
-def strike_from_delta(option_type, target_delta_pct, S, T, r, sigma):
-    target_delta = target_delta_pct / 100.0
-    if option_type == 'P':
-        target_delta = -target_delta
+# --- OPTION CHAIN GENERATOR (WITH VOL SKEW) ---
+def build_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_strikes=15):
+    T = max(0.00001, dte / 365.0)
+    atm_strike = round(spot / strike_step) * strike_step
+    half_strikes = num_strikes // 2
+    
+    strikes = [atm_strike + i * strike_step for i in range(-half_strikes, half_strikes + 1)]
+    chain = []
+    
+    for K in strikes:
+        # Modellierung von Volatility Skew (Put Skew typisch höher für Indizes)
+        moneyness = np.log(K / spot)
+        skew_iv = base_iv - (moneyness * 15.0) + (moneyness**2 * 25.0)
+        sigma = max(0.05, skew_iv / 100.0)
         
-    if option_type == 'C':
-        d1 = norm.ppf(target_delta)
-    else:
-        d1 = norm.ppf(1 + target_delta)
+        c_price = bs_price('C', spot, K, T, r, sigma)
+        c_greeks = bs_greeks('C', spot, K, T, r, sigma)
         
-    K = S * np.exp(-d1 * sigma * np.sqrt(T) + (r + 0.5 * sigma**2) * T)
-    return round(K / 5.0) * 5.0
+        p_price = bs_price('P', spot, K, T, r, sigma)
+        p_greeks = bs_greeks('P', spot, K, T, r, sigma)
+        
+        chain.append({
+            "Call Delta": round(c_greeks['delta'], 2),
+            "Call Price ($)": round(c_price, 2),
+            "Call IV (%)": round(skew_iv, 2),
+            "Strike": float(K),
+            "Put IV (%)": round(skew_iv, 2),
+            "Put Price ($)": round(p_price, 2),
+            "Put Delta": round(p_greeks['delta'], 2)
+        })
+        
+    return pd.DataFrame(chain)
 
 # --- LIVE DATA FETCHER ---
 TICKER_MAP = {
@@ -151,90 +171,6 @@ def fetch_delayed_spot(ticker_symbol):
     except Exception:
         pass
     return None
-
-def generate_dte_iv_table(spot_price, base_iv, r=0.045):
-    today = date.today()
-    records = []
-    
-    for dte in range(0, 41):
-        target_dt = today + timedelta(days=dte)
-        weekday_str = target_dt.strftime("%a")
-        dt_str = target_dt.strftime("%Y-%m-%d")
-        status = get_market_status(target_dt)
-
-        if dte == 0:
-            iv_dte = base_iv * 1.35
-        elif dte <= 7:
-            iv_dte = base_iv * (1.20 - (dte * 0.02))
-        else:
-            iv_dte = base_iv * (1.0 + np.sin(dte / 10.0) * 0.03)
-
-        sigma = iv_dte / 100.0
-        T = max(0.00001, dte / 365.0)
-        
-        em_pts = spot_price * sigma * np.sqrt(T) if dte > 0 else 0.0
-        em_pct = (em_pts / spot_price) * 100.0
-        
-        records.append({
-            "DTE": dte,
-            "Date": dt_str,
-            "Day": weekday_str,
-            "Market Status": status,
-            "IV (%)": round(iv_dte, 2),
-            "Exp. Move (± Pts)": round(em_pts, 2),
-            "Call ITM (Δ70)": int(strike_from_delta("C", 70, spot_price, T, r, sigma)),
-            "Call ATM (Δ50)": int(strike_from_delta("C", 50, spot_price, T, r, sigma)),
-            "Call OTM (Δ30)": int(strike_from_delta("C", 30, spot_price, T, r, sigma)),
-            "Put ITM (Δ70)": int(strike_from_delta("P", 70, spot_price, T, r, sigma)),
-            "Put ATM (Δ50)": int(strike_from_delta("P", 50, spot_price, T, r, sigma)),
-            "Put OTM (Δ30)": int(strike_from_delta("P", 30, spot_price, T, r, sigma)),
-        })
-    return pd.DataFrame(records)
-
-
-# --- IBKR POSITIONS IMPORT ENGINE ---
-def fetch_ibkr_positions(host='127.0.0.1', port=7497, client_id=1):
-    if not IBKR_AVAILABLE:
-        st.error("Weder 'ib_async' noch 'ib_insync' ist installiert. Bitte 'pip install ib-async' ausführen.")
-        return None
-        
-    ib = IB()
-    try:
-        ib.connect(host, port, clientId=client_id, timeout=5)
-        positions = ib.positions()
-        
-        imported_legs = []
-        today = datetime.now().date()
-        
-        for pos in positions:
-            contract = pos.contract
-            if contract.secType == 'OPT':
-                exp_date = datetime.strptime(contract.lastTradeDateOrContractMonth, "%Y%m%d").date()
-                dte = max(0, (exp_date - today).days)
-                
-                multiplier = float(contract.multiplier) if contract.multiplier else 100.0
-                entry_price = round(pos.avgCost / multiplier, 2)
-                
-                imported_legs.append({
-                    "Enable": True,
-                    "Phase": "Initial",
-                    "Type": "C" if contract.right in ["C", "CALL"] else "P",
-                    "Strike": float(contract.strike),
-                    "DTE": int(dte),
-                    "IV_%": 18.0,
-                    "Qty": int(pos.position),
-                    "Entry_Price": entry_price
-                })
-                
-        ib.disconnect()
-        return pd.DataFrame(imported_legs) if imported_legs else pd.DataFrame()
-        
-    except Exception as e:
-        st.error(f"Verbindungsfehler zu IBKR TWS: {e}")
-        if ib.isConnected():
-            ib.disconnect()
-        return None
-
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.title("⚙️ Base & Data Settings")
@@ -270,30 +206,14 @@ if st.session_state["last_symbol"] != underlying_symbol:
     st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔌 Interactive Brokers (TWS) Import")
-
-ib_port = st.sidebar.number_input("TWS Port (7497 Paper / 7496 Live)", value=7497, step=1)
-
-if st.sidebar.button("📥 Positions aus TWS Laden"):
-    with st.spinner("Verbinde mit TWS und lade Positionen..."):
-        ib_df = fetch_ibkr_positions(port=int(ib_port))
-        if ib_df is not None:
-            if not ib_df.empty:
-                st.session_state["legs_df"] = ib_df
-                st.sidebar.success(f"{len(ib_df)} Beine von IBKR importiert!")
-                st.rerun()
-            else:
-                st.sidebar.warning("Keine offenen Optionspositionen in TWS gefunden.")
-
-st.sidebar.markdown("---")
 st.sidebar.subheader("📝 Portfolio Positions Manager")
 
 col_btn1, col_btn2 = st.sidebar.columns(2)
-if col_btn1.button("🔄 Sync/Reset Default"):
+if col_btn1.button("🔄 Sync/Reset"):
     st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
     st.rerun()
 
-if col_btn2.button("🗑️ Alle Löschen"):
+if col_btn2.button("🗑️ Clear All"):
     st.session_state["legs_df"] = pd.DataFrame(columns=["Enable", "Phase", "Type", "Strike", "DTE", "IV_%", "Qty", "Entry_Price"])
     st.rerun()
 
@@ -315,188 +235,53 @@ edited_df = st.sidebar.data_editor(
 
 st.session_state["legs_df"] = edited_df
 
+# --- MAIN DASHBOARD INTERFACE ---
+st.title(f"📈 OptionNet Explorer - Option Chain & DTE Comparison ({underlying_symbol})")
 
-# --- MAIN CALCULATIONS ---
-active_legs = edited_df[edited_df["Enable"] == True].copy() if not edited_df.empty else pd.DataFrame()
-initial_legs = active_legs[active_legs["Phase"] == "Initial"] if not active_legs.empty else pd.DataFrame()
+tab1, tab2 = st.tabs(["⚔️ DTE Comparison Matrix (z.B. DTE 15 vs DTE 22)", "🔍 Single Option Chain Explorer"])
 
-if not active_legs.empty and "Strike" in active_legs and len(active_legs["Strike"].dropna()) > 0:
-    min_strike = active_legs["Strike"].min()
-    max_strike = active_legs["Strike"].max()
-    x_min = min(spot_price * 0.85, min_strike * 0.90)
-    x_max = max(spot_price * 1.15, max_strike * 1.10)
-else:
-    x_min = spot_price * 0.85
-    x_max = spot_price * 1.15
+# --- TAB 1: DTE COMPARISON MATRIX ---
+with tab1:
+    st.subheader("📊 Direktvergleich zweier Verfallstage (DTE A vs. DTE B)")
+    
+    col_a, col_b = st.columns(2)
+    with col_a:
+        dte_a = st.number_input("Wähle DTE A", value=15, min_value=0, max_value=120, step=1)
+        dt_a = date.today() + timedelta(days=int(dte_a))
+        st.caption(f"Verfall Datum A: `{dt_a.strftime('%Y-%m-%d (%A)')}` | Status: {get_market_status(dt_a)}")
+        
+    with col_b:
+        dte_b = st.number_input("Wähle DTE B", value=22, min_value=0, max_value=120, step=1)
+        dt_b = date.today() + timedelta(days=int(dte_b))
+        st.caption(f"Verfall Datum B: `{dt_b.strftime('%Y-%m-%d (%A)')}` | Status: {get_market_status(dt_b)}")
 
-spot_range = np.linspace(x_min, x_max, 500)
-
-pnl_t0 = np.zeros_like(spot_range)
-pnl_t1 = np.zeros_like(spot_range)
-pnl_exp = np.zeros_like(spot_range)
-pnl_initial_t0 = np.zeros_like(spot_range)
-
-spot_pnl_t0 = 0.0
-spot_pnl_t1 = 0.0
-tot_delta, tot_gamma, tot_theta, tot_vega = 0.0, 0.0, 0.0, 0.0
-
-if not active_legs.empty:
-    for _, row in active_legs.iterrows():
-        try:
-            opt_type = str(row["Type"])
-            strike = float(row["Strike"])
-            dte = float(row["DTE"])
-            iv = float(row["IV_%"]) / 100.0
-            qty = float(row["Qty"])
-            entry = float(row["Entry_Price"])
-            
-            t_t0 = max(0.00001, dte / 365.0)
-            t_t1 = max(0.00001, max(0.0, dte - 1) / 365.0)
-            
-            exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
-            pnl_exp += (exp_prices - entry) * qty * 100.0
-            
-            t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
-            pnl_t0 += (t0_prices - entry) * qty * 100.0
-            
-            t1_prices = np.array([bs_price(opt_type, s, strike, t_t1, risk_free_rate, iv) for s in spot_range])
-            pnl_t1 += (t1_prices - entry) * qty * 100.0
-            
-            val_t0 = bs_price(opt_type, spot_price, strike, t_t0, risk_free_rate, iv)
-            val_t1 = bs_price(opt_type, spot_price, strike, t_t1, risk_free_rate, iv)
-            spot_pnl_t0 += (val_t0 - entry) * qty * 100.0
-            spot_pnl_t1 += (val_t1 - entry) * qty * 100.0
-            
-            g = bs_greeks(opt_type, spot_price, strike, t_t0, risk_free_rate, iv)
-            tot_delta += g['delta'] * qty * 100.0
-            tot_gamma += g['gamma'] * qty * 100.0
-            tot_theta += g['theta'] * qty * 100.0
-            tot_vega += g['vega'] * qty * 100.0
-        except (ValueError, KeyError):
-            continue
-
-if not initial_legs.empty and len(active_legs) > len(initial_legs):
-    for _, row in initial_legs.iterrows():
-        try:
-            opt_type = str(row["Type"])
-            strike = float(row["Strike"])
-            dte = float(row["DTE"])
-            iv = float(row["IV_%"]) / 100.0
-            qty = float(row["Qty"])
-            entry = float(row["Entry_Price"])
-            
-            t_t0 = max(0.00001, dte / 365.0)
-            t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
-            pnl_initial_t0 += (t0_prices - entry) * qty * 100.0
-        except (ValueError, KeyError):
-            continue
-
-
-# --- DASHBOARD LAYOUT ---
-st.title(f"📈 OptionNet Explorer ({underlying_symbol})")
-
-# Header KPI Metrics
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("T+0 Current PnL", f"${spot_pnl_t0:,.2f}")
-k2.metric("T+1 Projected PnL", f"${spot_pnl_t1:,.2f}", f"${(spot_pnl_t1 - spot_pnl_t0):,.2f}")
-k3.metric("Net Delta", f"{tot_delta:,.2f}")
-k4.metric("Net Theta ($/Tag)", f"{tot_theta:,.2f}")
-k5.metric("Net Vega", f"{tot_vega:,.2f}")
-
-st.markdown("---")
-
-# SECTION 1: RISK CHART
-st.subheader("📉 Position Risk Graph (T+0 & T+1 mit Spot Price Marker)")
-
-fig = go.Figure()
-
-fig.add_trace(go.Scatter(
-    x=spot_range, y=pnl_t0, mode='lines', name='T+0 (Gesamte Position Heute)',
-    line=dict(color='#ff5252', width=3),
-    hovertemplate="Spot: %{x:.2f}<br>PnL T+0: $%{y:,.2f}"
-))
-
-fig.add_trace(go.Scatter(
-    x=spot_range, y=pnl_t1, mode='lines', name='T+1 (Gesamte Position Morgen)',
-    line=dict(color='#66bb6a', width=2, dash='dash'),
-    hovertemplate="Spot: %{x:.2f}<br>PnL T+1: $%{y:,.2f}"
-))
-
-if not initial_legs.empty and len(active_legs) > len(initial_legs):
-    fig.add_trace(go.Scatter(
-        x=spot_range, y=pnl_initial_t0, mode='lines', name='Initial Position (Vor Adjustment)',
-        line=dict(color='#9e9e9e', width=1.5, dash='dot'),
-        hovertemplate="Spot: %{x:.2f}<br>Initial PnL: $%{y:,.2f}"
-    ))
-
-fig.add_trace(go.Scatter(
-    x=spot_range, y=pnl_exp, mode='lines', name='Expiration PnL',
-    line=dict(color='#29b6f6', width=1.5),
-    hovertemplate="Spot: %{x:.2f}<br>Exp PnL: $%{y:,.2f}"
-))
-
-fig.add_hline(y=0, line_dash="solid", line_color="#455a64", line_width=1)
-fig.add_vline(x=spot_price, line_dash="dot", line_color="#ffffff", line_width=1.5)
-
-fig.add_annotation(
-    x=spot_price, y=spot_pnl_t0,
-    text=f" <b>T+0 Spot: ${spot_pnl_t0:,.2f}</b>",
-    showarrow=True, arrowhead=2, ax=60, ay=-30,
-    bgcolor="#ff5252", bordercolor="#ffffff", font=dict(color="white", size=11)
-)
-
-fig.add_annotation(
-    x=spot_price, y=spot_pnl_t1,
-    text=f" <b>T+1 Spot: ${spot_pnl_t1:,.2f}</b>",
-    showarrow=True, arrowhead=2, ax=60, ay=30,
-    bgcolor="#66bb6a", bordercolor="#ffffff", font=dict(color="white", size=11)
-)
-
-fig.update_layout(
-    title=f"Risk Profile - {underlying_symbol} @ {spot_price}",
-    xaxis_title="Underlying Price",
-    yaxis_title="Profit / Loss ($)",
-    template="plotly_dark",
-    height=550,
-    hovermode="x unified",
-    legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("---")
-
-# SECTION 2: DTE & US HOLIDAYS CALENDAR GRID
-st.subheader("📅 DTE 0 bis 40 & US Feiertage / Börsenkalender")
-
-c_picker, c_info = st.columns([1, 2])
-
-with c_picker:
-    selected_target_date = st.date_input(
-        "📆 Wunsch-Verfallsdatum prüfen",
-        value=date.today() + timedelta(days=30),
-        min_value=date.today(),
-        max_value=date.today() + timedelta(days=120)
+    chain_a = build_option_chain(spot_price, dte_a, base_iv, r=risk_free_rate)
+    chain_b = build_option_chain(spot_price, dte_b, base_iv, r=risk_free_rate)
+    
+    # Merge für direkten Vergleich
+    comp_df = pd.merge(
+        chain_a[["Strike", "Put IV (%)", "Put Price ($)", "Call Price ($)", "Call IV (%)"]],
+        chain_b[["Strike", "Put IV (%)", "Put Price ($)", "Call Price ($)", "Call IV (%)"]],
+        on="Strike",
+        suffixes=(f" (DTE {dte_a})", f" (DTE {dte_b})")
     )
+    
+    # IV Diff Spalten hinzufügen
+    comp_df["Put IV Diff (%)"] = round(comp_df[f"Put IV (%) (DTE {dte_b})"] - comp_df[f"Put IV (%) (DTE {dte_a})"], 2)
+    comp_df["Call IV Diff (%)"] = round(comp_df[f"Call IV (%) (DTE {dte_b})"] - comp_df[f"Call IV (%) (DTE {dte_a})"], 2)
+    
+    st.markdown(f"#### Vergleichstabelle Spot: `${spot_price}`")
+    st.dataframe(comp_df, use_container_width=True, height=450)
 
-calc_dte = (selected_target_date - date.today()).days
-target_status = get_market_status(selected_target_date)
-
-with c_info:
-    st.info(
-        f"**Ausgewähltes Datum:** `{selected_target_date.strftime('%Y-%m-%d (%A)')}`  \n"
-        f"**Berechnetes DTE:** `{calc_dte} Tage`  \n"
-        f"**US Markt Status:** {target_status}"
+# --- TAB 2: SINGLE OPTION CHAIN EXPLORER ---
+with tab2:
+    st.subheader("🔍 Option Chain Explorer")
+    selected_dte = st.slider("DTE auswählen", 0, 60, value=30)
+    
+    single_chain = build_option_chain(spot_price, selected_dte, base_iv, r=risk_free_rate, num_strikes=21)
+    
+    st.dataframe(
+        single_chain,
+        use_container_width=True,
+        height=550
     )
-
-dte_df = generate_dte_iv_table(spot_price, base_iv, r=risk_free_rate)
-
-f_col1, _ = st.columns([3, 1])
-dte_range = f_col1.slider("DTE Bereich eingrenzen", 0, 40, (0, 40))
-filtered_dte_df = dte_df[(dte_df["DTE"] >= dte_range[0]) & (dte_df["DTE"] <= dte_range[1])]
-
-st.dataframe(
-    filtered_dte_df,
-    use_container_width=True,
-    height=450
-)
