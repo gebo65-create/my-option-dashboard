@@ -155,16 +155,21 @@ def calculate_phase_margin(legs_subset, spot_price):
             
     return round(total_margin, 2)
 
-# --- OPTION CHAIN BUILDER ---
+# --- OPTION CHAIN BUILDER (SORTIERT AB ATM DIE ERSTE ZEILE) ---
 def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_strikes=17):
     T = max(0.00001, dte / 365.0)
     atm_strike = round(spot / strike_step) * strike_step
     half_strikes = num_strikes // 2
     
-    strikes = [atm_strike + i * strike_step for i in range(-half_strikes, half_strikes + 1)]
+    # Sortierung umstellen: ATM zuerst, danach im Wechsel darüber / darunter
+    ordered_strikes = [atm_strike]
+    for i in range(1, half_strikes + 1):
+        ordered_strikes.append(atm_strike + i * strike_step)
+        ordered_strikes.append(atm_strike - i * strike_step)
+        
     chain = []
     
-    for K in strikes:
+    for K in ordered_strikes:
         moneyness = np.log(K / spot)
         skew_iv = base_iv - (moneyness * 12.0) + (moneyness**2 * 20.0)
         sigma = max(0.05, skew_iv / 100.0)
@@ -175,7 +180,10 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_s
         p_price = bs_price('P', spot, K, T, r, sigma)
         p_greeks = bs_greeks('P', spot, K, T, r, sigma)
         
+        is_atm = (K == atm_strike)
+        
         chain.append({
+            "ATM_Marker": "🎯 ATM" if is_atm else "",
             "C_Theta": round(c_greeks['theta'], 2),
             "C_Gamma": round(c_greeks['gamma'], 4),
             "C_Delta": round(c_greeks['delta'], 2),
@@ -189,9 +197,17 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_s
             "P_Delta": round(p_greeks['delta'], 2),
             "P_Gamma": round(p_greeks['gamma'], 4),
             "P_Theta": round(p_greeks['theta'], 2),
+            "IS_ATM": is_atm
         })
         
     return pd.DataFrame(chain)
+
+# Funktion zur farblichen Hervorhebung der ATM-Zeile
+def highlight_atm(row):
+    if row.get("IS_ATM", False):
+        return ['background-color: #8b0000; color: white; font-weight: bold;'] * len(row)
+    else:
+        return [''] * len(row)
 
 # --- LIVE SPOT DATA ---
 TICKER_MAP = {
@@ -242,11 +258,10 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🛡️ Display Options")
 show_margin = st.sidebar.checkbox("Margin Details anzeigen", value=True)
 
-# --- MULTI-POSITION / MULTI-STRATEGY MANAGER ---
+# --- MULTI-POSITION MANAGER ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔀 Strategie / Position Manager")
 
-# Initialisiere Multi-Portfolio Daten im Session State
 if "portfolios" not in st.session_state:
     st.session_state["portfolios"] = {
         "Position 1 (Hauptposition)": pd.DataFrame(get_default_legs(spot_price, base_iv)),
@@ -256,7 +271,6 @@ if "portfolios" not in st.session_state:
     }
     st.session_state["active_portfolio_name"] = "Position 1 (Hauptposition)"
 
-# Dropdown zur Auswahl der aktiven Position
 portfolio_names = list(st.session_state["portfolios"].keys())
 
 selected_pos = st.sidebar.selectbox(
@@ -267,7 +281,6 @@ selected_pos = st.sidebar.selectbox(
 
 st.session_state["active_portfolio_name"] = selected_pos
 
-# Neue Position erstellen
 with st.sidebar.expander("➕ Neue Position erstellen"):
     new_pos_name = st.text_input("Name der neuen Position:", placeholder="z.B. Iron Condor SPX")
     if st.button("Position anlegen"):
@@ -278,7 +291,6 @@ with st.sidebar.expander("➕ Neue Position erstellen"):
         elif new_pos_name in st.session_state["portfolios"]:
             st.warning("Eine Position mit diesem Namen existiert bereits!")
 
-# Aktive Position löschen
 if len(st.session_state["portfolios"]) > 1:
     if st.sidebar.button(f"🗑️ '{selected_pos}' löschen"):
         del st.session_state["portfolios"][selected_pos]
@@ -296,7 +308,6 @@ if col_btn2.button("🗑️ Clear Legs"):
     st.session_state["portfolios"][selected_pos] = pd.DataFrame(columns=["Enable", "Phase", "Type", "Strike", "DTE", "IV_%", "Qty", "Entry_Price"])
     st.rerun()
 
-# Data Editor speichert direkt in die gewählte Strategie
 edited_df = st.sidebar.data_editor(
     st.session_state["portfolios"][selected_pos],
     num_rows="dynamic",
@@ -468,18 +479,25 @@ chain_df_2 = build_classic_option_chain(spot_price, selected_dte_2, base_iv, r=r
 tab_chain1, tab_comp = st.tabs([f"🏛️ Option Chain (DTE {selected_dte_1})", f"⚔️ DTE {selected_dte_1} vs DTE {selected_dte_2} Matrix"])
 
 with tab_chain1:
-    st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) - Spot @ `{spot_price}`**")
+    st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) — Spot @ `{spot_price}` (ATM oben & rot markiert)**")
+    
+    # Hilfskolonne "IS_ATM" für die Anzeige ausblenden
+    display_chain_1 = chain_df_1.drop(columns=["IS_ATM"])
+    
+    # Styling anwenden
+    styled_df_1 = chain_df_1.style.apply(highlight_atm, axis=1).hide(axis="columns", subset=["IS_ATM"])
+    
     st.dataframe(
-        chain_df_1,
+        styled_df_1,
         use_container_width=True,
         height=480
     )
 
 with tab_comp:
-    st.markdown(f"**Direktvergleich: DTE {selected_dte_1} vs. DTE {selected_dte_2}**")
+    st.markdown(f"**Direktvergleich: DTE {selected_dte_1} vs. DTE {selected_dte_2} (ATM oben & rot markiert)**")
     
     comp_merged = pd.merge(
-        chain_df_1[["STRIKE", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
+        chain_df_1[["STRIKE", "ATM_Marker", "IS_ATM", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
         chain_df_2[["STRIKE", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
         on="STRIKE",
         suffixes=(f" (DTE {selected_dte_1})", f" (DTE {selected_dte_2})")
@@ -490,8 +508,10 @@ with tab_comp:
     comp_merged["Call Price Diff ($)"] = round(comp_merged[f"C_Ask (DTE {selected_dte_2})"] - comp_merged[f"C_Ask (DTE {selected_dte_1})"], 2)
     comp_merged["Put Price Diff ($)"] = round(comp_merged[f"P_Ask (DTE {selected_dte_2})"] - comp_merged[f"P_Ask (DTE {selected_dte_1})"], 2)
 
+    styled_comp = comp_merged.style.apply(highlight_atm, axis=1).hide(axis="columns", subset=["IS_ATM"])
+
     st.dataframe(
-        comp_merged,
+        styled_comp,
         use_container_width=True,
         height=480
     )
