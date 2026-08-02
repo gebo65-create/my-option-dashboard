@@ -6,7 +6,7 @@ from scipy.stats import norm
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Pro Trade Adjustments", 
+    page_title="OptionNet Explorer - Advanced Analytics & Adjustments", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -77,7 +77,7 @@ def calculate_expected_move(S, iv_pct, dte):
     em_points = S * sigma * np.sqrt(T)
     return em_points, S - em_points, S + em_points
 
-# --- FLEXIBLE STRATEGY BUILDER WITH ADJUSTMENT FIELDS ---
+# --- FLEXIBLE STRATEGY BUILDER ---
 def build_custom_strategy(strategy_type, option_mode, S, iv_default=18.0):
     iv = iv_default / 100.0
     r = 0.045
@@ -151,11 +151,12 @@ if "last_config" not in st.session_state or st.session_state["last_config"] != c
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Time Travel (T+X Days)")
+show_t1 = st.sidebar.checkbox("Show T+1 Line (Morgen)", value=True)
 days_forward = st.sidebar.slider("Days Elapsed (Forward in Time)", min_value=0, max_value=60, value=0, step=1)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📝 Portfolio & Adjustment Legs")
-st.sidebar.info("💡 **Adjustierung:** Setze `Status` auf `Closed` und trage den `Close_Price` ein. Füge über `+` neue Legs als `Adjustment` hinzu.")
+show_initial_overlay = st.sidebar.checkbox("Overlay 'Initial Trade Only' Curve", value=True)
 
 legs_df = pd.DataFrame(st.session_state["legs_data"])
 
@@ -177,13 +178,14 @@ edited_df = st.sidebar.data_editor(
 )
 
 
-# --- CALCULATION ENGINE WITH REALIZED PNL ---
+# --- CALCULATION ENGINE WITH REALIZED PNL & T+1 ---
 active_legs = edited_df[edited_df["Enable"] == True] if not edited_df.empty else edited_df
 
 open_legs = active_legs[active_legs["Status"] == "Open"] if not active_legs.empty else pd.DataFrame()
 closed_legs = active_legs[active_legs["Status"] == "Closed"] if not active_legs.empty else pd.DataFrame()
+initial_open_legs = open_legs[open_legs["Phase"] == "Initial"] if not open_legs.empty else pd.DataFrame()
 
-# 1. Calculate Realized PnL from Closed Legs
+# 1. Realized PnL from Closed Legs
 realized_pnl = 0.0
 if not closed_legs.empty:
     for _, row in closed_legs.iterrows():
@@ -192,7 +194,7 @@ if not closed_legs.empty:
         qty = float(row["Qty"])
         realized_pnl += (close_p - entry) * qty * 100.0
 
-# 2. Calculate Expected Move (based on open legs)
+# 2. Expected Move
 if not open_legs.empty:
     avg_iv = open_legs["IV_%"].mean()
     min_dte = open_legs["DTE"].min()
@@ -208,14 +210,16 @@ x_min = min(spot_price * 0.85, min_strike * 0.90, em_lower * 0.95)
 x_max = max(spot_price * 1.15, max_strike * 1.10, em_upper * 1.05)
 spot_range = np.linspace(x_min, x_max, 500)
 
-# Base PnL initialized with Realized PnL from closed positions
+# Base PnL Arrays
 pnl_exp = np.full_like(spot_range, realized_pnl)
 pnl_t0 = np.full_like(spot_range, realized_pnl)
+pnl_t1 = np.full_like(spot_range, realized_pnl)
 pnl_tx = np.full_like(spot_range, realized_pnl)
+pnl_initial_t0 = np.zeros_like(spot_range)
 
 tot_delta, tot_gamma, tot_theta, tot_vega = 0.0, 0.0, 0.0, 0.0
 
-# 3. Add Unrealized PnL and Greeks from Open Legs
+# 3. Open Legs Calculations (Combined Portfolio)
 if not open_legs.empty:
     for _, row in open_legs.iterrows():
         opt_type = str(row["Type"])
@@ -227,30 +231,49 @@ if not open_legs.empty:
         
         t_exp = dte / 365.0
         t_t0 = max(0.00001, dte / 365.0)
+        t_t1 = max(0.00001, (dte - 1) / 365.0)
         t_tx = max(0.00001, (dte - days_forward) / 365.0)
         
-        # Expiration PnL
+        # Expiration
         exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
         pnl_exp += (exp_prices - entry) * qty * 100.0
         
-        # T+0 PnL
+        # T+0 (Heute)
         t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
         pnl_t0 += (t0_prices - entry) * qty * 100.0
         
-        # T+X PnL
+        # T+1 (Morgen)
+        t1_prices = np.array([bs_price(opt_type, s, strike, t_t1, risk_free_rate, iv) for s in spot_range])
+        pnl_t1 += (t1_prices - entry) * qty * 100.0
+        
+        # T+X (Eingestellter Slider)
         tx_prices = np.array([bs_price(opt_type, s, strike, t_tx, risk_free_rate, iv) for s in spot_range])
         pnl_tx += (tx_prices - entry) * qty * 100.0
         
-        # Greeks (Only active for Open legs!)
+        # Net Greeks
         greeks = bs_greeks(opt_type, spot_price, strike, t_tx, risk_free_rate, iv)
         tot_delta += greeks['delta'] * qty * 100.0
         tot_gamma += greeks['gamma'] * qty * 100.0
         tot_theta += greeks['theta'] * qty * 100.0
         tot_vega += greeks['vega'] * qty * 100.0
 
+# 4. Separate Initial Trade Overlay Calculation
+if show_initial_overlay and not initial_open_legs.empty:
+    for _, row in initial_open_legs.iterrows():
+        opt_type = str(row["Type"])
+        strike = float(row["Strike"])
+        dte = float(row["DTE"])
+        iv = float(row["IV_%"]) / 100.0
+        qty = float(row["Qty"])
+        entry = float(row["Entry_Price"])
+        
+        t_t0 = max(0.00001, dte / 365.0)
+        t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
+        pnl_initial_t0 += (t0_prices - entry) * qty * 100.0
+
 
 # --- MAIN DASHBOARD LAYOUT ---
-st.title(f"📈 Combined Position Analytics - {strategy_choice} ({option_mode})")
+st.title(f"📈 Advanced Position Analytics - {strategy_choice} ({option_mode})")
 
 # Top KPI Bar
 kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
@@ -268,18 +291,30 @@ fig = go.Figure()
 
 # Expiration Line (Total Combined)
 fig.add_trace(go.Scatter(
-    x=spot_range, y=pnl_exp, mode='lines', name='Total Expiration PnL', line=dict(color='#29b6f6', width=2.5)
+    x=spot_range, y=pnl_exp, mode='lines', name='Expiration PnL', line=dict(color='#29b6f6', width=2.5)
 ))
 
-# T+0 Line (Total Combined)
+# T+0 Line (Total Combined - Rot)
 fig.add_trace(go.Scatter(
-    x=spot_range, y=pnl_t0, mode='lines', name='Total T+0 (Heute)', line=dict(color='#ff5252', width=2.5)
+    x=spot_range, y=pnl_t0, mode='lines', name='T+0 (Heute)', line=dict(color='#ff5252', width=2.5)
 ))
 
-# T+X Line
-if days_forward > 0:
+# T+1 Line (Morgen - Grün)
+if show_t1:
     fig.add_trace(go.Scatter(
-        x=spot_range, y=pnl_tx, mode='lines', name=f'Total T+{days_forward} Tage', line=dict(color='#ffa726', width=2, dash='dash')
+        x=spot_range, y=pnl_t1, mode='lines', name='T+1 (Morgen)', line=dict(color='#66bb6a', width=1.8, dash='dash')
+    ))
+
+# T+X Line (Orange gestrichelt)
+if days_forward > 1:
+    fig.add_trace(go.Scatter(
+        x=spot_range, y=pnl_tx, mode='lines', name=f'T+{days_forward} Tage', line=dict(color='#ffa726', width=2, dash='dot')
+    ))
+
+# Initial Position Overlay Line (Grau gestrichelt)
+if show_initial_overlay and not initial_open_legs.empty and len(open_legs) > len(initial_open_legs):
+    fig.add_trace(go.Scatter(
+        x=spot_range, y=pnl_initial_t0, mode='lines', name='Initial Position (Pre-ADJ)', line=dict(color='#9e9e9e', width=1.5, dash='dashdot')
     ))
 
 # Zero Baseline
@@ -291,7 +326,7 @@ fig.add_vline(
     annotation_text=f" Spot: {spot_price}", annotation_position="top right"
 )
 
-# Expected Move Lines
+# Expected Move Lines (ONE Style)
 fig.add_vline(
     x=em_lower, line_dash="dash", line_color="#ab47bc", line_width=1.5,
     annotation_text=f"-EM: {em_lower:,.1f}", annotation_position="bottom left"
@@ -302,11 +337,11 @@ fig.add_vline(
 )
 
 fig.update_layout(
-    title=f"Combined Risk Chart (Includes Realized PnL: ${realized_pnl:,.2f})",
+    title=f"Risk Chart ONE Style ({underlying_symbol}) - T+0, T+1 & Expiration",
     xaxis_title=f"Underlying Price ({underlying_symbol})",
     yaxis_title="Total PnL ($)",
     template="plotly_dark",
-    height=550,
+    height=580,
     hovermode="x unified",
     legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
 )
@@ -314,5 +349,5 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # Table display
-st.subheader("📋 Complete Portfolio Legs (Initial & Adjustments)")
+st.subheader("📋 Complete Portfolio Legs")
 st.dataframe(edited_df, use_container_width=True)
