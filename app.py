@@ -161,7 +161,6 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_s
     atm_strike = round(spot / strike_step) * strike_step
     half_strikes = num_strikes // 2
     
-    # Sortierung umstellen: ATM zuerst, danach im Wechsel darüber / darunter
     ordered_strikes = [atm_strike]
     for i in range(1, half_strikes + 1):
         ordered_strikes.append(atm_strike + i * strike_step)
@@ -202,7 +201,6 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_s
         
     return pd.DataFrame(chain)
 
-# Funktion zur farblichen Hervorhebung der ATM-Zeile
 def highlight_atm(row):
     if row.get("IS_ATM", False):
         return ['background-color: #8b0000; color: white; font-weight: bold;'] * len(row)
@@ -358,12 +356,15 @@ pnl_exp = np.zeros_like(spot_range)
 spot_pnl_t0, spot_pnl_t1 = 0.0, 0.0
 tot_delta, tot_gamma, tot_theta, tot_vega = 0.0, 0.0, 0.0, 0.0
 
+summary_rows = []
+
 if not active_legs.empty:
     for _, row in active_legs.iterrows():
         try:
             if pd.isna(row.get("Qty")) or pd.isna(row.get("Strike")) or pd.isna(row.get("DTE")) or pd.isna(row.get("IV_%")) or pd.isna(row.get("Entry_Price")):
                 continue
 
+            phase = str(row.get("Phase", "Initial"))
             opt_type = str(row["Type"])
             strike = float(row["Strike"])
             dte = float(row["DTE"])
@@ -389,10 +390,29 @@ if not active_legs.empty:
             spot_pnl_t1 += (val_t1 - entry) * qty * 100.0
             
             g = bs_greeks(opt_type, spot_price, strike, t_t0, risk_free_rate, iv)
-            tot_delta += g['delta'] * qty * 100.0
-            tot_gamma += g['gamma'] * qty * 100.0
-            tot_theta += g['theta'] * qty * 100.0
-            tot_vega += g['vega'] * qty * 100.0
+            l_delta = g['delta'] * qty * 100.0
+            l_gamma = g['gamma'] * qty * 100.0
+            l_theta = g['theta'] * qty * 100.0
+            l_vega = g['vega'] * qty * 100.0
+
+            tot_delta += l_delta
+            tot_gamma += l_gamma
+            tot_theta += l_theta
+            tot_vega += l_vega
+
+            summary_rows.append({
+                "Phase": phase,
+                "Typ": opt_type,
+                "Strike": strike,
+                "DTE": int(dte),
+                "Qty": int(qty),
+                "Entry ($)": entry,
+                "Total Value ($)": round(entry * qty * 100.0, 2),
+                "Delta": round(l_delta, 2),
+                "Gamma": round(l_gamma, 4),
+                "Theta ($)": round(l_theta, 2),
+                "Vega ($)": round(l_vega, 2)
+            })
         except (ValueError, KeyError, TypeError):
             continue
 
@@ -416,6 +436,48 @@ else:
     m3.metric("Position Delta", f"{tot_delta:,.2f}")
     m4.metric("Position Theta", f"${tot_theta:,.2f}")
     m5.metric("Position Vega", f"${tot_vega:,.2f}")
+
+st.markdown("---")
+
+# SECTION 0: GESAMTPOSITION & LEGS SUMMARY
+st.subheader(f"📊 Übersicht Gesamtposition & Adjustierungen — {selected_pos}")
+
+if summary_rows:
+    df_summary = pd.DataFrame(summary_rows)
+    
+    # Berechne Summenzeile für Gesamtposition
+    total_qty = df_summary["Qty"].sum()
+    total_val = df_summary["Total Value ($)"].sum()
+    
+    total_row = pd.DataFrame([{
+        "Phase": "GESAMTPOSITION",
+        "Typ": "ALL",
+        "Strike": "-",
+        "DTE": "-",
+        "Qty": total_qty,
+        "Entry ($)": "-",
+        "Total Value ($)": round(total_val, 2),
+        "Delta": round(tot_delta, 2),
+        "Gamma": round(tot_gamma, 4),
+        "Theta ($)": round(tot_theta, 2),
+        "Vega ($)": round(tot_vega, 2)
+    }])
+    
+    full_summary_df = pd.concat([df_summary, total_row], ignore_index=True)
+    
+    # Stylen der Gesamtzeile (Hervorhebung)
+    def highlight_total_row(row):
+        if row["Phase"] == "GESAMTPOSITION":
+            return ['background-color: #1e3d59; color: #ffffff; font-weight: bold;'] * len(row)
+        elif row["Phase"] == "Adjustment":
+            return ['background-color: #2b2b36; color: #ffab40;'] * len(row)
+        else:
+            return [''] * len(row)
+
+    styled_summary = full_summary_df.style.apply(highlight_total_row, axis=1)
+    st.dataframe(styled_summary, use_container_width=True)
+else:
+    st.info("Keine aktiven Positionen ausgewählt. Bitte erstelle Legs in der SideBar.")
 
 st.markdown("---")
 
@@ -481,10 +543,6 @@ tab_chain1, tab_comp = st.tabs([f"🏛️ Option Chain (DTE {selected_dte_1})", 
 with tab_chain1:
     st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) — Spot @ `{spot_price}` (ATM oben & rot markiert)**")
     
-    # Hilfskolonne "IS_ATM" für die Anzeige ausblenden
-    display_chain_1 = chain_df_1.drop(columns=["IS_ATM"])
-    
-    # Styling anwenden
     styled_df_1 = chain_df_1.style.apply(highlight_atm, axis=1).hide(axis="columns", subset=["IS_ATM"])
     
     st.dataframe(
