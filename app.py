@@ -28,7 +28,7 @@ except ImportError:
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Chain & DTE Comparison", 
+    page_title="OptionNet Explorer - Full Chain & Risk Graph", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -37,11 +37,11 @@ st.set_page_config(
 st.markdown("""
 <style>
     [data-testid="stMetricValue"] {
-        font-size: 1.2rem !important;
+        font-size: 1.1rem !important;
         font-weight: bold;
     }
     .main .block-container {
-        padding-top: 1.2rem;
+        padding-top: 1rem;
         padding-bottom: 2rem;
     }
 </style>
@@ -86,7 +86,7 @@ def get_market_status(target_date):
     else:
         return "🟢 Open"
 
-# --- BLACK-SCHOLES & GREEKS HELPER FUNCTIONS ---
+# --- BLACK-SCHOLES & GREEKS ---
 def bs_price(option_type, S, K, T, r, sigma):
     if T <= 0.00001:
         return np.maximum(0.0, S - K) if option_type == 'C' else np.maximum(0.0, K - S)
@@ -119,8 +119,8 @@ def bs_greeks(option_type, S, K, T, r, sigma):
     
     return {'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega}
 
-# --- OPTION CHAIN GENERATOR (WITH VOL SKEW) ---
-def build_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_strikes=15):
+# --- OPTION CHAIN BUILDER (OPTIONNET EXPLORER STYLE) ---
+def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_strikes=17):
     T = max(0.00001, dte / 365.0)
     atm_strike = round(spot / strike_step) * strike_step
     half_strikes = num_strikes // 2
@@ -129,9 +129,9 @@ def build_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_strikes=1
     chain = []
     
     for K in strikes:
-        # Modellierung von Volatility Skew (Put Skew typisch höher für Indizes)
         moneyness = np.log(K / spot)
-        skew_iv = base_iv - (moneyness * 15.0) + (moneyness**2 * 25.0)
+        # Volatility Skew (Put IV gewichtet höher bei OTM Puts)
+        skew_iv = base_iv - (moneyness * 12.0) + (moneyness**2 * 20.0)
         sigma = max(0.05, skew_iv / 100.0)
         
         c_price = bs_price('C', spot, K, T, r, sigma)
@@ -141,18 +141,24 @@ def build_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_strikes=1
         p_greeks = bs_greeks('P', spot, K, T, r, sigma)
         
         chain.append({
-            "Call Delta": round(c_greeks['delta'], 2),
-            "Call Price ($)": round(c_price, 2),
-            "Call IV (%)": round(skew_iv, 2),
-            "Strike": float(K),
-            "Put IV (%)": round(skew_iv, 2),
-            "Put Price ($)": round(p_price, 2),
-            "Put Delta": round(p_greeks['delta'], 2)
+            "C_Theta": round(c_greeks['theta'], 2),
+            "C_Gamma": round(c_greeks['gamma'], 4),
+            "C_Delta": round(c_greeks['delta'], 2),
+            "C_IV_%": round(skew_iv, 1),
+            "C_Bid": round(c_price * 0.98, 2),
+            "C_Ask": round(c_price * 1.02, 2),
+            "STRIKE": float(K),
+            "P_Ask": round(p_price * 1.02, 2),
+            "P_Bid": round(p_price * 0.98, 2),
+            "P_IV_%": round(skew_iv, 1),
+            "P_Delta": round(p_greeks['delta'], 2),
+            "P_Gamma": round(p_greeks['gamma'], 4),
+            "P_Theta": round(p_greeks['theta'], 2),
         })
         
     return pd.DataFrame(chain)
 
-# --- LIVE DATA FETCHER ---
+# --- LIVE SPOT DATA ---
 TICKER_MAP = {
     "SPX": "^GSPC",
     "DAX": "^GDAXI",
@@ -172,8 +178,8 @@ def fetch_delayed_spot(ticker_symbol):
         pass
     return None
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.title("⚙️ Base & Data Settings")
+# --- SIDEBAR & PORTFOLIO ---
+st.sidebar.title("⚙️ Base Settings & Positions")
 
 underlying_symbol = st.sidebar.selectbox("Underlying Symbol", list(TICKER_MAP.keys()), index=0)
 ticker = TICKER_MAP[underlying_symbol]
@@ -182,7 +188,7 @@ live_spot = fetch_delayed_spot(ticker)
 default_spot = live_spot if live_spot is not None else 600.0
 
 spot_price = st.sidebar.number_input(
-    f"Current Spot Price ({'Live/Delayed' if live_spot else 'Manual'})", 
+    f"Spot Price ({'Live/Delayed' if live_spot else 'Manual'})", 
     value=default_spot, 
     step=1.0
 )
@@ -206,10 +212,10 @@ if st.session_state["last_symbol"] != underlying_symbol:
     st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("📝 Portfolio Positions Manager")
+st.sidebar.subheader("📝 Portfolio Manager")
 
 col_btn1, col_btn2 = st.sidebar.columns(2)
-if col_btn1.button("🔄 Sync/Reset"):
+if col_btn1.button("🔄 Reset Portfolio"):
     st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
     st.rerun()
 
@@ -235,53 +241,145 @@ edited_df = st.sidebar.data_editor(
 
 st.session_state["legs_df"] = edited_df
 
-# --- MAIN DASHBOARD INTERFACE ---
-st.title(f"📈 OptionNet Explorer - Option Chain & DTE Comparison ({underlying_symbol})")
+# --- PNL & RISK CALCULATION ---
+active_legs = edited_df[edited_df["Enable"] == True].copy() if not edited_df.empty else pd.DataFrame()
 
-tab1, tab2 = st.tabs(["⚔️ DTE Comparison Matrix (z.B. DTE 15 vs DTE 22)", "🔍 Single Option Chain Explorer"])
+if not active_legs.empty and "Strike" in active_legs and len(active_legs["Strike"].dropna()) > 0:
+    min_strike = active_legs["Strike"].min()
+    max_strike = active_legs["Strike"].max()
+    x_min = min(spot_price * 0.85, min_strike * 0.90)
+    x_max = max(spot_price * 1.15, max_strike * 1.10)
+else:
+    x_min = spot_price * 0.85
+    x_max = spot_price * 1.15
 
-# --- TAB 1: DTE COMPARISON MATRIX ---
-with tab1:
-    st.subheader("📊 Direktvergleich zweier Verfallstage (DTE A vs. DTE B)")
+spot_range = np.linspace(x_min, x_max, 400)
+
+pnl_t0 = np.zeros_like(spot_range)
+pnl_t1 = np.zeros_like(spot_range)
+pnl_exp = np.zeros_like(spot_range)
+
+spot_pnl_t0, spot_pnl_t1 = 0.0, 0.0
+tot_delta, tot_gamma, tot_theta, tot_vega = 0.0, 0.0, 0.0, 0.0
+
+if not active_legs.empty:
+    for _, row in active_legs.iterrows():
+        try:
+            opt_type = str(row["Type"])
+            strike = float(row["Strike"])
+            dte = float(row["DTE"])
+            iv = float(row["IV_%"]) / 100.0
+            qty = float(row["Qty"])
+            entry = float(row["Entry_Price"])
+            
+            t_t0 = max(0.00001, dte / 365.0)
+            t_t1 = max(0.00001, max(0.0, dte - 1) / 365.0)
+            
+            exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
+            pnl_exp += (exp_prices - entry) * qty * 100.0
+            
+            t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
+            pnl_t0 += (t0_prices - entry) * qty * 100.0
+            
+            t1_prices = np.array([bs_price(opt_type, s, strike, t_t1, risk_free_rate, iv) for s in spot_range])
+            pnl_t1 += (t1_prices - entry) * qty * 100.0
+            
+            val_t0 = bs_price(opt_type, spot_price, strike, t_t0, risk_free_rate, iv)
+            val_t1 = bs_price(opt_type, spot_price, strike, t_t1, risk_free_rate, iv)
+            spot_pnl_t0 += (val_t0 - entry) * qty * 100.0
+            spot_pnl_t1 += (val_t1 - entry) * qty * 100.0
+            
+            g = bs_greeks(opt_type, spot_price, strike, t_t0, risk_free_rate, iv)
+            tot_delta += g['delta'] * qty * 100.0
+            tot_gamma += g['gamma'] * qty * 100.0
+            tot_theta += g['theta'] * qty * 100.0
+            tot_vega += g['vega'] * qty * 100.0
+        except (ValueError, KeyError):
+            continue
+
+# --- MAIN WORKSPACE ---
+st.title(f"📈 OptionNet Explorer Professional ({underlying_symbol})")
+
+# Top KPI Header
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("PnL T+0 (Heute)", f"${spot_pnl_t0:,.2f}")
+m2.metric("PnL T+1 (Morgen)", f"${spot_pnl_t1:,.2f}", f"${(spot_pnl_t1 - spot_pnl_t0):,.2f}")
+m3.metric("Position Delta", f"{tot_delta:,.2f}")
+m4.metric("Position Theta ($/Tag)", f"{tot_theta:,.2f}")
+m5.metric("Position Vega", f"{tot_vega:,.2f}")
+
+st.markdown("---")
+
+# SECTION 1: RISK GRAPH
+st.subheader("📉 Risk Profile Graph")
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=spot_range, y=pnl_t0, mode='lines', name='T+0 (Heute)', line=dict(color='#ff5252', width=3)))
+fig.add_trace(go.Scatter(x=spot_range, y=pnl_t1, mode='lines', name='T+1 (Morgen)', line=dict(color='#66bb6a', width=2, dash='dash')))
+fig.add_trace(go.Scatter(x=spot_range, y=pnl_exp, mode='lines', name='Expiration PnL', line=dict(color='#29b6f6', width=1.5)))
+
+fig.add_hline(y=0, line_dash="solid", line_color="#555555", line_width=1)
+fig.add_vline(x=spot_price, line_dash="dot", line_color="#ffffff", line_width=1.5)
+
+fig.update_layout(
+    xaxis_title="Underlying Price",
+    yaxis_title="Profit / Loss ($)",
+    template="plotly_dark",
+    height=420,
+    hovermode="x unified",
+    margin=dict(l=20, r=20, t=30, b=20)
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+
+# SECTION 2: CLASSIC OPTION CHAIN & DTE COMPARISON
+st.subheader("⛓️ Option Chain & Multi-DTE Analysis")
+
+c1, c2, c3 = st.columns([1, 1, 2])
+with c1:
+    selected_dte_1 = st.number_input("DTE A (z.B. Primary)", value=15, min_value=0, max_value=120)
+    dt1 = date.today() + timedelta(days=int(selected_dte_1))
+    st.caption(f"Datum A: `{dt1.strftime('%Y-%m-%d')}` | Status: {get_market_status(dt1)}")
+
+with c2:
+    selected_dte_2 = st.number_input("DTE B (z.B. Vergleich)", value=22, min_value=0, max_value=120)
+    dt2 = date.today() + timedelta(days=int(selected_dte_2))
+    st.caption(f"Datum B: `{dt2.strftime('%Y-%m-%d')}` | Status: {get_market_status(dt2)}")
+
+with c3:
+    num_strikes_view = st.slider("Anzahl Strikes anzeigen", 11, 31, 17, step=2)
+
+chain_df_1 = build_classic_option_chain(spot_price, selected_dte_1, base_iv, r=risk_free_rate, num_strikes=num_strikes_view)
+chain_df_2 = build_classic_option_chain(spot_price, selected_dte_2, base_iv, r=risk_free_rate, num_strikes=num_strikes_view)
+
+tab_chain1, tab_comp = st.tabs([f"🏛️ Option Chain (DTE {selected_dte_1})", f"⚔️ DTE {selected_dte_1} vs DTE {selected_dte_2} IV/Price Difference Matrix"])
+
+with tab_chain1:
+    st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) - Spot @ `{spot_price}`**")
+    st.dataframe(
+        chain_df_1,
+        use_container_width=True,
+        height=480
+    )
+
+with tab_comp:
+    st.markdown(f"**Direktvergleich: DTE {selected_dte_1} vs. DTE {selected_dte_2}**")
     
-    col_a, col_b = st.columns(2)
-    with col_a:
-        dte_a = st.number_input("Wähle DTE A", value=15, min_value=0, max_value=120, step=1)
-        dt_a = date.today() + timedelta(days=int(dte_a))
-        st.caption(f"Verfall Datum A: `{dt_a.strftime('%Y-%m-%d (%A)')}` | Status: {get_market_status(dt_a)}")
-        
-    with col_b:
-        dte_b = st.number_input("Wähle DTE B", value=22, min_value=0, max_value=120, step=1)
-        dt_b = date.today() + timedelta(days=int(dte_b))
-        st.caption(f"Verfall Datum B: `{dt_b.strftime('%Y-%m-%d (%A)')}` | Status: {get_market_status(dt_b)}")
-
-    chain_a = build_option_chain(spot_price, dte_a, base_iv, r=risk_free_rate)
-    chain_b = build_option_chain(spot_price, dte_b, base_iv, r=risk_free_rate)
-    
-    # Merge für direkten Vergleich
-    comp_df = pd.merge(
-        chain_a[["Strike", "Put IV (%)", "Put Price ($)", "Call Price ($)", "Call IV (%)"]],
-        chain_b[["Strike", "Put IV (%)", "Put Price ($)", "Call Price ($)", "Call IV (%)"]],
-        on="Strike",
-        suffixes=(f" (DTE {dte_a})", f" (DTE {dte_b})")
+    comp_merged = pd.merge(
+        chain_df_1[["STRIKE", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
+        chain_df_2[["STRIKE", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
+        on="STRIKE",
+        suffixes=(f" (DTE {selected_dte_1})", f" (DTE {selected_dte_2})")
     )
     
-    # IV Diff Spalten hinzufügen
-    comp_df["Put IV Diff (%)"] = round(comp_df[f"Put IV (%) (DTE {dte_b})"] - comp_df[f"Put IV (%) (DTE {dte_a})"], 2)
-    comp_df["Call IV Diff (%)"] = round(comp_df[f"Call IV (%) (DTE {dte_b})"] - comp_df[f"Call IV (%) (DTE {dte_a})"], 2)
-    
-    st.markdown(f"#### Vergleichstabelle Spot: `${spot_price}`")
-    st.dataframe(comp_df, use_container_width=True, height=450)
+    comp_merged["Call IV Diff (%)"] = round(comp_merged[f"C_IV_% (DTE {selected_dte_2})"] - comp_merged[f"C_IV_% (DTE {selected_dte_1})"], 1)
+    comp_merged["Put IV Diff (%)"] = round(comp_merged[f"P_IV_% (DTE {selected_dte_2})"] - comp_merged[f"P_IV_% (DTE {selected_dte_1})"], 1)
+    comp_merged["Call Price Diff ($)"] = round(comp_merged[f"C_Ask (DTE {selected_dte_2})"] - comp_merged[f"C_Ask (DTE {selected_dte_1})"], 2)
+    comp_merged["Put Price Diff ($)"] = round(comp_merged[f"P_Ask (DTE {selected_dte_2})"] - comp_merged[f"P_Ask (DTE {selected_dte_1})"], 2)
 
-# --- TAB 2: SINGLE OPTION CHAIN EXPLORER ---
-with tab2:
-    st.subheader("🔍 Option Chain Explorer")
-    selected_dte = st.slider("DTE auswählen", 0, 60, value=30)
-    
-    single_chain = build_option_chain(spot_price, selected_dte, base_iv, r=risk_free_rate, num_strikes=21)
-    
     st.dataframe(
-        single_chain,
+        comp_merged,
         use_container_width=True,
-        height=550
+        height=480
     )
