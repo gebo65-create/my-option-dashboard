@@ -155,16 +155,16 @@ def calculate_phase_margin(legs_subset, spot_price):
             
     return round(total_margin, 2)
 
-# --- OPTION CHAIN BUILDER (SORTIERT AB ATM DIE ERSTE ZEILE) ---
-def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_strikes=17):
+# --- OPTION CHAIN BUILDER (JETZT MIT DYNAMISCHEN STRIKE-SCHRITTEN) ---
+def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=1.0, num_strikes=17):
     T = max(0.00001, dte / 365.0)
     atm_strike = round(spot / strike_step) * strike_step
     half_strikes = num_strikes // 2
     
     ordered_strikes = [atm_strike]
     for i in range(1, half_strikes + 1):
-        ordered_strikes.append(atm_strike + i * strike_step)
-        ordered_strikes.append(atm_strike - i * strike_step)
+        ordered_strikes.append(round(atm_strike + i * strike_step, 2))
+        ordered_strikes.append(round(atm_strike - i * strike_step, 2))
         
     chain = []
     
@@ -179,7 +179,7 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=5, num_s
         p_price = bs_price('P', spot, K, T, r, sigma)
         p_greeks = bs_greeks('P', spot, K, T, r, sigma)
         
-        is_atm = (K == atm_strike)
+        is_atm = (abs(K - atm_strike) < 0.001)
         
         chain.append({
             "ATM_Marker": "🎯 ATM" if is_atm else "",
@@ -210,10 +210,10 @@ def highlight_atm(row):
 # --- LIVE SPOT DATA ---
 TICKER_MAP = {
     "SPX": "^GSPC",
-    "DAX": "^GDAXI",
     "SPY": "SPY",
-    "QQQ": "QQQ",
-    "RUT": "^RUT"
+    "RUT": "^RUT",
+    "DAX": "^GDAXI",
+    "QQQ": "QQQ"
 }
 
 @st.cache_data(ttl=300)
@@ -229,9 +229,9 @@ def fetch_delayed_spot(ticker_symbol):
 
 def get_default_legs(current_spot, current_iv):
     return [
-        {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": round(current_spot, -1), "DTE": 30, "IV_%": current_iv, "Qty": 10, "Entry_Price": round(current_spot * 0.02, 2)},
-        {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(current_spot * 0.95, -1), "DTE": 30, "IV_%": current_iv, "Qty": -10, "Entry_Price": round(current_spot * 0.01, 2)},
-        {"Enable": True, "Phase": "Adjustment", "Type": "P", "Strike": round(current_spot * 0.90, -1), "DTE": 20, "IV_%": current_iv + 2, "Qty": -5, "Entry_Price": round(current_spot * 0.008, 2)},
+        {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": round(current_spot, 0), "DTE": 30, "IV_%": current_iv, "Qty": 10, "Entry_Price": round(current_spot * 0.02, 2)},
+        {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(current_spot * 0.95, 0), "DTE": 30, "IV_%": current_iv, "Qty": -10, "Entry_Price": round(current_spot * 0.01, 2)},
+        {"Enable": True, "Phase": "Adjustment", "Type": "P", "Strike": round(current_spot * 0.90, 0), "DTE": 20, "IV_%": current_iv + 2, "Qty": -5, "Entry_Price": round(current_spot * 0.008, 2)},
     ]
 
 # --- SIDEBAR & PORTFOLIO ---
@@ -241,12 +241,21 @@ underlying_symbol = st.sidebar.selectbox("Underlying Symbol", list(TICKER_MAP.ke
 ticker = TICKER_MAP[underlying_symbol]
 
 live_spot = fetch_delayed_spot(ticker)
-default_spot = live_spot if live_spot is not None else 600.0
+default_spot = live_spot if live_spot is not None else (600.0 if underlying_symbol == "SPY" else 6000.0)
 
 spot_price = st.sidebar.number_input(
     f"Spot Price ({'Live/Delayed' if live_spot else 'Manual'})", 
     value=default_spot, 
     step=1.0
+)
+
+# Standardschrittweite für SPY, SPX, RUT auf 1.0 setzen
+default_step_idx = 0 if underlying_symbol in ["SPX", "SPY", "RUT"] else 2
+strike_step_val = st.sidebar.selectbox(
+    "Strike Schrittweite (Option Chain)",
+    options=[1.0, 2.5, 5.0, 10.0],
+    index=default_step_idx,
+    help="1.0 wählen für 1er-Schritte bei SPY, SPX, RUT"
 )
 
 base_iv = st.sidebar.number_input("Base IV (%)", value=18.0, step=0.5)
@@ -255,6 +264,7 @@ risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", value=4.5, step=0
 st.sidebar.markdown("---")
 st.sidebar.subheader("🛡️ Display Options")
 show_margin = st.sidebar.checkbox("Margin Details anzeigen", value=True)
+show_individual_legs_graph = st.sidebar.checkbox("Einzel-Legs im Risikograph einblenden", value=True)
 
 # --- MULTI-POSITION MANAGER ---
 st.sidebar.markdown("---")
@@ -264,7 +274,7 @@ if "portfolios" not in st.session_state:
     st.session_state["portfolios"] = {
         "Position 1 (Hauptposition)": pd.DataFrame(get_default_legs(spot_price, base_iv)),
         "Position 2 (Hedge/Spread)": pd.DataFrame([
-            {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(spot_price * 0.92, -1), "DTE": 45, "IV_%": base_iv, "Qty": 5, "Entry_Price": round(spot_price * 0.015, 2)}
+            {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(spot_price * 0.92, 0), "DTE": 45, "IV_%": base_iv, "Qty": 5, "Entry_Price": round(spot_price * 0.015, 2)}
         ])
     }
     st.session_state["active_portfolio_name"] = "Position 1 (Hauptposition)"
@@ -314,7 +324,7 @@ edited_df = st.sidebar.data_editor(
         "Enable": st.column_config.CheckboxColumn("Aktiv", default=True),
         "Phase": st.column_config.SelectboxColumn("Phase", options=["Initial", "Adjustment"], default="Initial"),
         "Type": st.column_config.SelectboxColumn("Typ", options=["C", "P"], required=True),
-        "Strike": st.column_config.NumberColumn("Strike", min_value=1.0, step=5.0),
+        "Strike": st.column_config.NumberColumn("Strike", min_value=1.0, step=1.0),
         "DTE": st.column_config.NumberColumn("DTE", min_value=0, step=1),
         "IV_%": st.column_config.NumberColumn("IV %", min_value=1.0, max_value=300.0, step=0.5),
         "Qty": st.column_config.NumberColumn("Qty (+/-)", step=1),
@@ -353,13 +363,15 @@ pnl_t0 = np.zeros_like(spot_range)
 pnl_t1 = np.zeros_like(spot_range)
 pnl_exp = np.zeros_like(spot_range)
 
+leg_exp_curves = []
+
 spot_pnl_t0, spot_pnl_t1 = 0.0, 0.0
 tot_delta, tot_gamma, tot_theta, tot_vega = 0.0, 0.0, 0.0, 0.0
 
 summary_rows = []
 
 if not active_legs.empty:
-    for _, row in active_legs.iterrows():
+    for idx, row in active_legs.iterrows():
         try:
             if pd.isna(row.get("Qty")) or pd.isna(row.get("Strike")) or pd.isna(row.get("DTE")) or pd.isna(row.get("IV_%")) or pd.isna(row.get("Entry_Price")):
                 continue
@@ -375,8 +387,13 @@ if not active_legs.empty:
             t_t0 = max(0.00001, dte / 365.0)
             t_t1 = max(0.00001, max(0.0, dte - 1) / 365.0)
             
-            exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
-            pnl_exp += (exp_prices - entry) * qty * 100.0
+            # Einzelne Leg Expiration PnL berechnen
+            leg_exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
+            single_leg_pnl_exp = (leg_exp_prices - entry) * qty * 100.0
+            
+            # Kumuliere auf Gesamtposition
+            pnl_exp += single_leg_pnl_exp
+            leg_exp_curves.append((f"Leg {len(leg_exp_curves)+1}: {qty:+g} {opt_type} @ {strike}", single_leg_pnl_exp))
             
             t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
             pnl_t0 += (t0_prices - entry) * qty * 100.0
@@ -445,7 +462,6 @@ st.subheader(f"📊 Übersicht Gesamtposition & Adjustierungen — {selected_pos
 if summary_rows:
     df_summary = pd.DataFrame(summary_rows)
     
-    # Berechne Summenzeile für Gesamtposition
     total_qty = df_summary["Qty"].sum()
     total_val = df_summary["Total Value ($)"].sum()
     
@@ -465,7 +481,6 @@ if summary_rows:
     
     full_summary_df = pd.concat([df_summary, total_row], ignore_index=True)
     
-    # Stylen der Gesamtzeile (Hervorhebung)
     def highlight_total_row(row):
         if row["Phase"] == "GESAMTPOSITION":
             return ['background-color: #1e3d59; color: #ffffff; font-weight: bold;'] * len(row)
@@ -495,22 +510,58 @@ if show_margin:
     
     st.markdown("---")
 
-# SECTION 2: RISK GRAPH
-st.subheader(f"📉 Risk Profile Graph — {selected_pos}")
+# SECTION 2: RISIKOGRAPH (GESAMTPOSITION + EINZELNE LEGS)
+st.subheader(f"📉 Risikograph Gesamtposition (Net Payoff) — {selected_pos}")
 
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=spot_range, y=pnl_t0, mode='lines', name='T+0 (Heute)', line=dict(color='#ff5252', width=3)))
-fig.add_trace(go.Scatter(x=spot_range, y=pnl_t1, mode='lines', name='T+1 (Morgen)', line=dict(color='#66bb6a', width=2, dash='dash')))
-fig.add_trace(go.Scatter(x=spot_range, y=pnl_exp, mode='lines', name='Expiration PnL', line=dict(color='#29b6f6', width=1.5)))
 
-fig.add_hline(y=0, line_dash="solid", line_color="#555555", line_width=1)
+# 1. Haupt-Linie: Kombinierte Gesamtposition am Verfallstag
+fig.add_trace(go.Scatter(
+    x=spot_range, 
+    y=pnl_exp, 
+    mode='lines', 
+    name='Gesamtposition Expiration PnL', 
+    line=dict(color='#29b6f6', width=3)
+))
+
+# 2. T+0 Linie (Heute)
+fig.add_trace(go.Scatter(
+    x=spot_range, 
+    y=pnl_t0, 
+    mode='lines', 
+    name='Gesamtposition T+0 (Heute)', 
+    line=dict(color='#ff5252', width=2)
+))
+
+# 3. T+1 Linie (Morgen)
+fig.add_trace(go.Scatter(
+    x=spot_range, 
+    y=pnl_t1, 
+    mode='lines', 
+    name='Gesamtposition T+1 (Morgen)', 
+    line=dict(color='#66bb6a', width=1.5, dash='dash')
+))
+
+# 4. Optionale Anzeige der Einzel-Legs als gestrichelte Orientierungslinien
+if show_individual_legs_graph and len(leg_exp_curves) > 1:
+    for leg_name, leg_pnl in leg_exp_curves:
+        fig.add_trace(go.Scatter(
+            x=spot_range, 
+            y=leg_pnl, 
+            mode='lines', 
+            name=f"Leg: {leg_name}", 
+            line=dict(width=1, dash='dot'),
+            opacity=0.5
+        ))
+
+fig.add_hline(y=0, line_dash="solid", line_color="#777777", line_width=1)
 fig.add_vline(x=spot_price, line_dash="dot", line_color="#ffffff", line_width=1.5)
 
 fig.update_layout(
-    xaxis_title="Underlying Price",
+    xaxis_title=f"Underlying Price ({underlying_symbol})",
     yaxis_title="Profit / Loss ($)",
     template="plotly_dark",
-    height=420,
+    height=450,
     hovermode="x unified",
     margin=dict(l=20, r=20, t=30, b=20)
 )
@@ -519,7 +570,7 @@ st.plotly_chart(fig, use_container_width=True)
 st.markdown("---")
 
 # SECTION 3: CLASSIC OPTION CHAIN & DTE COMPARISON
-st.subheader("⛓️ Option Chain & Multi-DTE Analysis")
+st.subheader(f"⛓️ Option Chain & Multi-DTE Analysis ({strike_step_val}-Schritte)")
 
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
@@ -533,26 +584,26 @@ with c2:
     st.caption(f"Datum B: `{dt2.strftime('%Y-%m-%d')}` | Status: {get_market_status(dt2)}")
 
 with c3:
-    num_strikes_view = st.slider("Anzahl Strikes anzeigen", 11, 31, 17, step=2)
+    num_strikes_view = st.slider("Anzahl Strikes anzeigen", 11, 35, 19, step=2)
 
-chain_df_1 = build_classic_option_chain(spot_price, selected_dte_1, base_iv, r=risk_free_rate, num_strikes=num_strikes_view)
-chain_df_2 = build_classic_option_chain(spot_price, selected_dte_2, base_iv, r=risk_free_rate, num_strikes=num_strikes_view)
+chain_df_1 = build_classic_option_chain(spot_price, selected_dte_1, base_iv, r=risk_free_rate, strike_step=strike_step_val, num_strikes=num_strikes_view)
+chain_df_2 = build_classic_option_chain(spot_price, selected_dte_2, base_iv, r=risk_free_rate, strike_step=strike_step_val, num_strikes=num_strikes_view)
 
 tab_chain1, tab_comp = st.tabs([f"🏛️ Option Chain (DTE {selected_dte_1})", f"⚔️ DTE {selected_dte_1} vs DTE {selected_dte_2} Matrix"])
 
 with tab_chain1:
-    st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) — Spot @ `{spot_price}` (ATM oben & rot markiert)**")
+    st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) — Spot @ `{spot_price}` (Schrittweite: `{strike_step_val}`)**")
     
     styled_df_1 = chain_df_1.style.apply(highlight_atm, axis=1).hide(axis="columns", subset=["IS_ATM"])
     
     st.dataframe(
         styled_df_1,
         use_container_width=True,
-        height=480
+        height=500
     )
 
 with tab_comp:
-    st.markdown(f"**Direktvergleich: DTE {selected_dte_1} vs. DTE {selected_dte_2} (ATM oben & rot markiert)**")
+    st.markdown(f"**Direktvergleich: DTE {selected_dte_1} vs. DTE {selected_dte_2} (Schrittweite: `{strike_step_val}`)**")
     
     comp_merged = pd.merge(
         chain_df_1[["STRIKE", "ATM_Marker", "IS_ATM", "C_IV_%", "C_Ask", "P_IV_%", "P_Ask"]],
@@ -571,5 +622,5 @@ with tab_comp:
     st.dataframe(
         styled_comp,
         use_container_width=True,
-        height=480
+        height=500
     )
