@@ -6,7 +6,7 @@ from scipy.stats import norm
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Advanced Analytics & Adjustments", 
+    page_title="OptionNet Explorer - Pro Margin & Analytics", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -15,7 +15,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     [data-testid="stMetricValue"] {
-        font-size: 1.3rem !important;
+        font-size: 1.25rem !important;
         font-weight: bold;
     }
     .main .block-container {
@@ -77,13 +77,59 @@ def calculate_expected_move(S, iv_pct, dte):
     em_points = S * sigma * np.sqrt(T)
     return em_points, S - em_points, S + em_points
 
-# --- FLEXIBLE STRATEGY BUILDER ---
+# --- MARGIN CALCULATION ENGINE ---
+def calculate_leg_margin(legs_df, spot_price):
+    if legs_df.empty:
+        return 0.0
+
+    total_margin = 0.0
+    
+    # Net Debit Calculation (Calendar Margin)
+    debit_credit = 0.0
+    for _, row in legs_df.iterrows():
+        qty = float(row["Qty"])
+        price = float(row["Entry_Price"])
+        debit_credit += price * qty * 100.0  # Positive = Debit paid, Negative = Credit received
+
+    # If position is Net Debit (like a Calendar / Long Diagonal), Base Margin = Debit Cost
+    if debit_credit > 0:
+        total_margin += debit_credit
+
+    # Additional Margin for Short Naked/Spread components
+    for _, row in legs_df.iterrows():
+        qty = float(row["Qty"])
+        strike = float(row["Strike"])
+        opt_type = str(row["Type"])
+        price = float(row["Entry_Price"])
+        
+        if qty < 0:  # Short Options
+            abs_qty = abs(qty)
+            if opt_type == "C":
+                otm = max(0.0, strike - spot_price)
+                margin_req = (0.20 * spot_price - otm + price) * 100.0 * abs_qty
+            else:
+                otm = max(0.0, spot_price - strike)
+                margin_req = (0.20 * spot_price - otm + price) * 100.0 * abs_qty
+            
+            # Minimum margin per contract rule (~10% underlying value)
+            min_margin = (0.10 * strike + price) * 100.0 * abs_qty
+            total_margin += max(margin_req, min_margin)
+
+    return max(total_margin, 0.0)
+
+# --- STRATEGY BUILDER ---
 def build_custom_strategy(strategy_type, option_mode, S, iv_default=18.0):
     iv = iv_default / 100.0
     r = 0.045
     legs = []
     
-    if strategy_type == "Diagonal":
+    if strategy_type == "Calendar":
+        k_c = strike_from_delta("C", 50, S, 30/365, r, iv)
+        legs.extend([
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -10, "Entry_Price": 12.0, "Close_Price": 0.0},
+            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_c, "DTE": 60, "Target_Delta": 50, "IV_%": iv_default, "Qty": 10, "Entry_Price": 18.5, "Close_Price": 0.0},
+        ])
+    elif strategy_type == "Diagonal":
         if option_mode in ["Calls Only", "Both (Call & Put)"]:
             k_short_c = strike_from_delta("C", 30, S, 30/365, r, iv)
             k_long_c = strike_from_delta("C", 70, S, 60/365, r, iv)
@@ -91,19 +137,6 @@ def build_custom_strategy(strategy_type, option_mode, S, iv_default=18.0):
                 {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_short_c, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 5.50, "Close_Price": 0.0},
                 {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_long_c, "DTE": 60, "Target_Delta": 70, "IV_%": iv_default, "Qty": 10, "Entry_Price": 22.0, "Close_Price": 0.0},
             ])
-        if option_mode in ["Puts Only", "Both (Call & Put)"]:
-            k_short_p = strike_from_delta("P", 30, S, 30/365, r, iv)
-            k_long_p = strike_from_delta("P", 70, S, 60/365, r, iv)
-            legs.extend([
-                {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": k_short_p, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 6.20, "Close_Price": 0.0},
-                {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": k_long_p, "DTE": 60, "Target_Delta": 70, "IV_%": iv_default, "Qty": 10, "Entry_Price": 24.5, "Close_Price": 0.0},
-            ])
-    elif strategy_type == "Calendar":
-        k_c = strike_from_delta("C", 50, S, 30/365, r, iv)
-        legs.extend([
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -10, "Entry_Price": 12.0, "Close_Price": 0.0},
-            {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_c, "DTE": 60, "Target_Delta": 50, "IV_%": iv_default, "Qty": 10, "Entry_Price": 18.5, "Close_Price": 0.0},
-        ])
     elif strategy_type == "Butterfly":
         k_center_c = strike_from_delta("C", 50, S, 30/365, r, iv)
         legs.extend([
@@ -111,7 +144,7 @@ def build_custom_strategy(strategy_type, option_mode, S, iv_default=18.0):
             {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_center_c, "DTE": 30, "Target_Delta": 50, "IV_%": iv_default, "Qty": -20, "Entry_Price": 12.0, "Close_Price": 0.0},
             {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "C", "Strike": k_center_c + 20, "DTE": 30, "Target_Delta": 35, "IV_%": iv_default, "Qty": 10, "Entry_Price": 4.5, "Close_Price": 0.0},
         ])
-    else:  # Custom / Iron Condor / BWB
+    else:  # Custom / Iron Condor
         legs.extend([
             {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": S - 20, "DTE": 30, "Target_Delta": 30, "IV_%": iv_default, "Qty": -10, "Entry_Price": 4.50, "Close_Price": 0.0},
             {"Enable": True, "Phase": "Initial", "Status": "Open", "Type": "P", "Strike": S - 40, "DTE": 30, "Target_Delta": 15, "IV_%": iv_default, "Qty": 10, "Entry_Price": 2.10, "Close_Price": 0.0},
@@ -135,7 +168,7 @@ col_strat, col_mode = st.sidebar.columns([1.2, 1])
 with col_strat:
     strategy_choice = st.selectbox(
         "Strategy Type",
-        ["Diagonal", "Calendar", "Butterfly", "Broken Wing Butterfly", "Iron Condor", "Custom"]
+        ["Calendar", "Diagonal", "Butterfly", "Iron Condor", "Custom"]
     )
 
 with col_mode:
@@ -150,13 +183,13 @@ if "last_config" not in st.session_state or st.session_state["last_config"] != c
     st.session_state["legs_data"] = build_custom_strategy(strategy_choice, option_mode, spot_price)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("📅 Time Travel (T+X Days)")
+st.sidebar.subheader("📅 Time Travel & Overlays")
 show_t1 = st.sidebar.checkbox("Show T+1 Line (Morgen)", value=True)
+show_initial_overlay = st.sidebar.checkbox("Overlay 'Initial Trade Only' Curve", value=True)
 days_forward = st.sidebar.slider("Days Elapsed (Forward in Time)", min_value=0, max_value=60, value=0, step=1)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📝 Portfolio & Adjustment Legs")
-show_initial_overlay = st.sidebar.checkbox("Overlay 'Initial Trade Only' Curve", value=True)
 
 legs_df = pd.DataFrame(st.session_state["legs_data"])
 
@@ -178,14 +211,21 @@ edited_df = st.sidebar.data_editor(
 )
 
 
-# --- CALCULATION ENGINE WITH REALIZED PNL & T+1 ---
+# --- CALCULATION ENGINE ---
 active_legs = edited_df[edited_df["Enable"] == True] if not edited_df.empty else edited_df
 
 open_legs = active_legs[active_legs["Status"] == "Open"] if not active_legs.empty else pd.DataFrame()
 closed_legs = active_legs[active_legs["Status"] == "Closed"] if not active_legs.empty else pd.DataFrame()
-initial_open_legs = open_legs[open_legs["Phase"] == "Initial"] if not open_legs.empty else pd.DataFrame()
 
-# 1. Realized PnL from Closed Legs
+initial_open = open_legs[open_legs["Phase"] == "Initial"] if not open_legs.empty else pd.DataFrame()
+adj_open = open_legs[open_legs["Phase"] == "Adjustment"] if not open_legs.empty else pd.DataFrame()
+
+# Margin Calculations
+margin_initial = calculate_leg_margin(initial_open, spot_price)
+margin_adj = calculate_leg_margin(adj_open, spot_price)
+margin_total = margin_initial + margin_adj
+
+# Realized PnL
 realized_pnl = 0.0
 if not closed_legs.empty:
     for _, row in closed_legs.iterrows():
@@ -194,7 +234,7 @@ if not closed_legs.empty:
         qty = float(row["Qty"])
         realized_pnl += (close_p - entry) * qty * 100.0
 
-# 2. Expected Move
+# Expected Move
 if not open_legs.empty:
     avg_iv = open_legs["IV_%"].mean()
     min_dte = open_legs["DTE"].min()
@@ -210,7 +250,6 @@ x_min = min(spot_price * 0.85, min_strike * 0.90, em_lower * 0.95)
 x_max = max(spot_price * 1.15, max_strike * 1.10, em_upper * 1.05)
 spot_range = np.linspace(x_min, x_max, 500)
 
-# Base PnL Arrays
 pnl_exp = np.full_like(spot_range, realized_pnl)
 pnl_t0 = np.full_like(spot_range, realized_pnl)
 pnl_t1 = np.full_like(spot_range, realized_pnl)
@@ -219,7 +258,6 @@ pnl_initial_t0 = np.zeros_like(spot_range)
 
 tot_delta, tot_gamma, tot_theta, tot_vega = 0.0, 0.0, 0.0, 0.0
 
-# 3. Open Legs Calculations (Combined Portfolio)
 if not open_legs.empty:
     for _, row in open_legs.iterrows():
         opt_type = str(row["Type"])
@@ -229,24 +267,20 @@ if not open_legs.empty:
         qty = float(row["Qty"])
         entry = float(row["Entry_Price"])
         
-        t_exp = dte / 365.0
         t_t0 = max(0.00001, dte / 365.0)
         t_t1 = max(0.00001, (dte - 1) / 365.0)
         t_tx = max(0.00001, (dte - days_forward) / 365.0)
         
-        # Expiration
+        # Expiration & T-Lines
         exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
         pnl_exp += (exp_prices - entry) * qty * 100.0
         
-        # T+0 (Heute)
         t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
         pnl_t0 += (t0_prices - entry) * qty * 100.0
         
-        # T+1 (Morgen)
         t1_prices = np.array([bs_price(opt_type, s, strike, t_t1, risk_free_rate, iv) for s in spot_range])
         pnl_t1 += (t1_prices - entry) * qty * 100.0
         
-        # T+X (Eingestellter Slider)
         tx_prices = np.array([bs_price(opt_type, s, strike, t_tx, risk_free_rate, iv) for s in spot_range])
         pnl_tx += (tx_prices - entry) * qty * 100.0
         
@@ -257,76 +291,75 @@ if not open_legs.empty:
         tot_theta += greeks['theta'] * qty * 100.0
         tot_vega += greeks['vega'] * qty * 100.0
 
-# 4. Separate Initial Trade Overlay Calculation
-if show_initial_overlay and not initial_open_legs.empty:
-    for _, row in initial_open_legs.iterrows():
+if show_initial_overlay and not initial_open.empty:
+    for _, row in initial_open.iterrows():
         opt_type = str(row["Type"])
         strike = float(row["Strike"])
         dte = float(row["DTE"])
         iv = float(row["IV_%"]) / 100.0
         qty = float(row["Qty"])
         entry = float(row["Entry_Price"])
-        
         t_t0 = max(0.00001, dte / 365.0)
         t0_prices = np.array([bs_price(opt_type, s, strike, t_t0, risk_free_rate, iv) for s in spot_range])
         pnl_initial_t0 += (t0_prices - entry) * qty * 100.0
 
 
 # --- MAIN DASHBOARD LAYOUT ---
-st.title(f"📈 Advanced Position Analytics - {strategy_choice} ({option_mode})")
+st.title(f"📈 Analytics & Margin Breakdown - {strategy_choice} ({option_mode})")
 
-# Top KPI Bar
-kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
-kpi1.metric("Realized PnL", f"${realized_pnl:,.2f}", delta_color="normal")
-kpi2.metric("Net Delta", f"{tot_delta:,.2f}")
-kpi3.metric("Net Gamma", f"{tot_gamma:,.4f}")
-kpi4.metric("Net Theta ($/Tag)", f"{tot_theta:,.2f}")
-kpi5.metric("Net Vega", f"{tot_vega:,.2f}")
-kpi6.metric(f"Expected Move ({min_dte} DTE)", f"±{em_pts:,.2f} pts", f"{em_lower:,.1f} - {em_upper:,.1f}")
+# Top KPI Bar - Row 1 (Greeks & PnL)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1.metric("Realized PnL", f"${realized_pnl:,.2f}")
+m2.metric("Net Delta", f"{tot_delta:,.2f}")
+m3.metric("Net Gamma", f"{tot_gamma:,.4f}")
+m4.metric("Net Theta ($/Tag)", f"{tot_theta:,.2f}")
+m5.metric("Net Vega", f"{tot_vega:,.2f}")
+m6.metric(f"Expected Move ({min_dte} DTE)", f"±{em_pts:,.2f} pts", f"{em_lower:,.1f} - {em_upper:,.1f}")
+
+st.markdown("---")
+
+# Top KPI Bar - Row 2 (Margin Metrics)
+margin_col1, margin_col2, margin_col3, margin_col4 = st.columns(4)
+margin_col1.metric("Margin Base Position (Calendar)", f"${margin_initial:,.2f}")
+margin_col2.metric("Margin Adjustment", f"${margin_adj:,.2f}", help="Zusätzliche Margin durch Adjustierungs-Legs")
+margin_col3.metric("TOTAL MARGIN REQUIRED", f"${margin_total:,.2f}")
+margin_col4.metric("Margin Return (Theta/Margin)", f"{(tot_theta/margin_total*100 if margin_total > 0 else 0):,.2f}% / Tag")
 
 st.markdown("---")
 
 # Plotly High-Precision Risk Chart
 fig = go.Figure()
 
-# Expiration Line (Total Combined)
 fig.add_trace(go.Scatter(
     x=spot_range, y=pnl_exp, mode='lines', name='Expiration PnL', line=dict(color='#29b6f6', width=2.5)
 ))
 
-# T+0 Line (Total Combined - Rot)
 fig.add_trace(go.Scatter(
     x=spot_range, y=pnl_t0, mode='lines', name='T+0 (Heute)', line=dict(color='#ff5252', width=2.5)
 ))
 
-# T+1 Line (Morgen - Grün)
 if show_t1:
     fig.add_trace(go.Scatter(
         x=spot_range, y=pnl_t1, mode='lines', name='T+1 (Morgen)', line=dict(color='#66bb6a', width=1.8, dash='dash')
     ))
 
-# T+X Line (Orange gestrichelt)
 if days_forward > 1:
     fig.add_trace(go.Scatter(
         x=spot_range, y=pnl_tx, mode='lines', name=f'T+{days_forward} Tage', line=dict(color='#ffa726', width=2, dash='dot')
     ))
 
-# Initial Position Overlay Line (Grau gestrichelt)
-if show_initial_overlay and not initial_open_legs.empty and len(open_legs) > len(initial_open_legs):
+if show_initial_overlay and not initial_open.empty and len(open_legs) > len(initial_open):
     fig.add_trace(go.Scatter(
         x=spot_range, y=pnl_initial_t0, mode='lines', name='Initial Position (Pre-ADJ)', line=dict(color='#9e9e9e', width=1.5, dash='dashdot')
     ))
 
-# Zero Baseline
 fig.add_hline(y=0, line_dash="dash", line_color="#78909c", line_width=1)
 
-# Current Spot Line
 fig.add_vline(
     x=spot_price, line_dash="dot", line_color="#ffffff", line_width=1.5, 
     annotation_text=f" Spot: {spot_price}", annotation_position="top right"
 )
 
-# Expected Move Lines (ONE Style)
 fig.add_vline(
     x=em_lower, line_dash="dash", line_color="#ab47bc", line_width=1.5,
     annotation_text=f"-EM: {em_lower:,.1f}", annotation_position="bottom left"
@@ -337,7 +370,7 @@ fig.add_vline(
 )
 
 fig.update_layout(
-    title=f"Risk Chart ONE Style ({underlying_symbol}) - T+0, T+1 & Expiration",
+    title=f"Risk Chart ONE Style ({underlying_symbol}) - Margin: ${margin_total:,.2f}",
     xaxis_title=f"Underlying Price ({underlying_symbol})",
     yaxis_title="Total PnL ($)",
     template="plotly_dark",
