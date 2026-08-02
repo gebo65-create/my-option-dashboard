@@ -13,7 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from scipy.stats import norm
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 # Versuche ib_async oder ib_insync zu importieren
 try:
@@ -28,7 +28,7 @@ except ImportError:
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Synchronized Portfolio", 
+    page_title="OptionNet Explorer - Calendar & US Holidays", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -46,6 +46,45 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# --- US MARKET HOLIDAYS (2025 - 2026) ---
+US_HOLIDAYS_2025_2026 = {
+    # 2025
+    date(2025, 1, 1): "New Year's Day (Closed)",
+    date(2025, 1, 20): "Martin Luther King Jr. Day (Closed)",
+    date(2025, 2, 17): "Presidents' Day (Closed)",
+    date(2025, 4, 18): "Good Friday (Closed)",
+    date(2025, 5, 26): "Memorial Day (Closed)",
+    date(2025, 6, 19): "Juneteenth (Closed)",
+    date(2025, 7, 3): "Early Close (1:00 PM ET)",
+    date(2025, 7, 4): "Independence Day (Closed)",
+    date(2025, 9, 1): "Labor Day (Closed)",
+    date(2025, 11, 27): "Thanksgiving Day (Closed)",
+    date(2025, 11, 28): "Early Close (1:00 PM ET)",
+    date(2025, 12, 24): "Early Close (1:00 PM ET)",
+    date(2025, 12, 25): "Christmas Day (Closed)",
+    # 2026
+    date(2026, 1, 1): "New Year's Day (Closed)",
+    date(2026, 1, 19): "Martin Luther King Jr. Day (Closed)",
+    date(2026, 2, 16): "Presidents' Day (Closed)",
+    date(2026, 4, 3): "Good Friday (Closed)",
+    date(2026, 5, 25): "Memorial Day (Closed)",
+    date(2026, 6, 19): "Juneteenth (Closed)",
+    date(2026, 7, 3): "Independence Day (Closed)",
+    date(2026, 9, 7): "Labor Day (Closed)",
+    date(2026, 11, 26): "Thanksgiving Day (Closed)",
+    date(2026, 11, 27): "Early Close (1:00 PM ET)",
+    date(2026, 12, 24): "Early Close (1:00 PM ET)",
+    date(2026, 12, 25): "Christmas Day (Closed)"
+}
+
+def get_market_status(target_date):
+    if target_date in US_HOLIDAYS_2025_2026:
+        return f"🔴 {US_HOLIDAYS_2025_2026[target_date]}"
+    elif target_date.weekday() >= 5:
+        return "🟡 Weekend (Closed)"
+    else:
+        return "🟢 Open"
 
 # --- BLACK-SCHOLES & GREEKS HELPER FUNCTIONS ---
 def bs_price(option_type, S, K, T, r, sigma):
@@ -114,8 +153,15 @@ def fetch_delayed_spot(ticker_symbol):
     return None
 
 def generate_dte_iv_table(spot_price, base_iv, r=0.045):
+    today = date.today()
     records = []
+    
     for dte in range(0, 41):
+        target_dt = today + timedelta(days=dte)
+        weekday_str = target_dt.strftime("%a")
+        dt_str = target_dt.strftime("%Y-%m-%d")
+        status = get_market_status(target_dt)
+
         if dte == 0:
             iv_dte = base_iv * 1.35
         elif dte <= 7:
@@ -131,9 +177,11 @@ def generate_dte_iv_table(spot_price, base_iv, r=0.045):
         
         records.append({
             "DTE": dte,
+            "Date": dt_str,
+            "Day": weekday_str,
+            "Market Status": status,
             "IV (%)": round(iv_dte, 2),
             "Exp. Move (± Pts)": round(em_pts, 2),
-            "Exp. Move (± %)": round(em_pct, 2),
             "Call ITM (Δ70)": int(strike_from_delta("C", 70, spot_price, T, r, sigma)),
             "Call ATM (Δ50)": int(strike_from_delta("C", 50, spot_price, T, r, sigma)),
             "Call OTM (Δ30)": int(strike_from_delta("C", 30, spot_price, T, r, sigma)),
@@ -194,7 +242,6 @@ st.sidebar.title("⚙️ Base & Data Settings")
 underlying_symbol = st.sidebar.selectbox("Underlying Symbol", list(TICKER_MAP.keys()), index=0)
 ticker = TICKER_MAP[underlying_symbol]
 
-# Automatischer Live Spot Fetch
 live_spot = fetch_delayed_spot(ticker)
 default_spot = live_spot if live_spot is not None else 600.0
 
@@ -207,14 +254,12 @@ spot_price = st.sidebar.number_input(
 base_iv = st.sidebar.number_input("Base IV (%)", value=18.0, step=0.5)
 risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", value=4.5, step=0.1) / 100.0
 
-# --- HELPER FUNCTION FOR DEFAULT LEGS ---
 def get_default_legs(current_spot, current_iv):
     return [
         {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": round(current_spot, -1), "DTE": 30, "IV_%": current_iv, "Qty": 10, "Entry_Price": round(current_spot * 0.02, 2)},
         {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(current_spot * 0.95, -1), "DTE": 30, "IV_%": current_iv, "Qty": -10, "Entry_Price": round(current_spot * 0.01, 2)},
     ]
 
-# Synchronisation prüfen: Falls Symbol gewechselt wurde, Default-Beine anpassen
 if "last_symbol" not in st.session_state:
     st.session_state["last_symbol"] = underlying_symbol
     st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
@@ -252,7 +297,6 @@ if col_btn2.button("🗑️ Alle Löschen"):
     st.session_state["legs_df"] = pd.DataFrame(columns=["Enable", "Phase", "Type", "Strike", "DTE", "IV_%", "Qty", "Entry_Price"])
     st.rerun()
 
-# Interaktiver Table-Editor
 edited_df = st.sidebar.data_editor(
     st.session_state["legs_df"],
     num_rows="dynamic",
@@ -276,7 +320,6 @@ st.session_state["legs_df"] = edited_df
 active_legs = edited_df[edited_df["Enable"] == True].copy() if not edited_df.empty else pd.DataFrame()
 initial_legs = active_legs[active_legs["Phase"] == "Initial"] if not active_legs.empty else pd.DataFrame()
 
-# Dynamische Achsen-Skalierung basierend auf den Strikes UND dem Spot-Preis
 if not active_legs.empty and "Strike" in active_legs and len(active_legs["Strike"].dropna()) > 0:
     min_strike = active_legs["Strike"].min()
     max_strike = active_legs["Strike"].max()
@@ -423,8 +466,28 @@ st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
 
-# SECTION 2: ALWAYS-VISIBLE DTE 0 - 40 OVERVIEW TABLE
-st.subheader("📅 DTE 0 bis 40 - Implizierte Volatilität, Expected Move & Strike Grid")
+# SECTION 2: DTE & US HOLIDAYS CALENDAR GRID
+st.subheader("📅 DTE 0 bis 40 & US Feiertage / Börsenkalender")
+
+c_picker, c_info = st.columns([1, 2])
+
+with c_picker:
+    selected_target_date = st.date_input(
+        "📆 Wunsch-Verfallsdatum prüfen",
+        value=date.today() + timedelta(days=30),
+        min_value=date.today(),
+        max_value=date.today() + timedelta(days=120)
+    )
+
+calc_dte = (selected_target_date - date.today()).days
+target_status = get_market_status(selected_target_date)
+
+with c_info:
+    st.info(
+        f"**Ausgewähltes Datum:** `{selected_target_date.strftime('%Y-%m-%d (%A)')}`  \n"
+        f"**Berechnetes DTE:** `{calc_dte} Tage`  \n"
+        f"**US Markt Status:** {target_status}"
+    )
 
 dte_df = generate_dte_iv_table(spot_price, base_iv, r=risk_free_rate)
 
