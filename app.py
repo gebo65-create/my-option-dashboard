@@ -15,7 +15,7 @@ from scipy.stats import norm
 import yfinance as yf
 from datetime import datetime
 
-# Versuche ib_async (bevorzugt) oder ib_insync zu importieren
+# Versuche ib_async oder ib_insync zu importieren
 try:
     from ib_async import IB, Option, util
     IBKR_AVAILABLE = True
@@ -28,7 +28,7 @@ except ImportError:
 
 # Page Configuration
 st.set_page_config(
-    page_title="OptionNet Explorer - Live Data & IBKR Integration", 
+    page_title="OptionNet Explorer - Synchronized Portfolio", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
@@ -93,7 +93,7 @@ def strike_from_delta(option_type, target_delta_pct, S, T, r, sigma):
     K = S * np.exp(-d1 * sigma * np.sqrt(T) + (r + 0.5 * sigma**2) * T)
     return round(K / 5.0) * 5.0
 
-# --- LIVE DATA FETCHER (YFINANCE - 5 MIN CACHE) ---
+# --- LIVE DATA FETCHER ---
 TICKER_MAP = {
     "SPX": "^GSPC",
     "DAX": "^GDAXI",
@@ -170,7 +170,7 @@ def fetch_ibkr_positions(host='127.0.0.1', port=7497, client_id=1):
                 imported_legs.append({
                     "Enable": True,
                     "Phase": "Initial",
-                    "Type": "C" if contract.right == "C" or contract.right == "CALL" else "P",
+                    "Type": "C" if contract.right in ["C", "CALL"] else "P",
                     "Strike": float(contract.strike),
                     "DTE": int(dte),
                     "IV_%": 18.0,
@@ -194,7 +194,7 @@ st.sidebar.title("⚙️ Base & Data Settings")
 underlying_symbol = st.sidebar.selectbox("Underlying Symbol", list(TICKER_MAP.keys()), index=0)
 ticker = TICKER_MAP[underlying_symbol]
 
-# Automatischer 5-Minuten Abruf
+# Automatischer Live Spot Fetch
 live_spot = fetch_delayed_spot(ticker)
 default_spot = live_spot if live_spot is not None else 600.0
 
@@ -206,6 +206,23 @@ spot_price = st.sidebar.number_input(
 
 base_iv = st.sidebar.number_input("Base IV (%)", value=18.0, step=0.5)
 risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", value=4.5, step=0.1) / 100.0
+
+# --- HELPER FUNCTION FOR DEFAULT LEGS ---
+def get_default_legs(current_spot, current_iv):
+    return [
+        {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": round(current_spot, -1), "DTE": 30, "IV_%": current_iv, "Qty": 10, "Entry_Price": round(current_spot * 0.02, 2)},
+        {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": round(current_spot * 0.95, -1), "DTE": 30, "IV_%": current_iv, "Qty": -10, "Entry_Price": round(current_spot * 0.01, 2)},
+    ]
+
+# Synchronisation prüfen: Falls Symbol gewechselt wurde, Default-Beine anpassen
+if "last_symbol" not in st.session_state:
+    st.session_state["last_symbol"] = underlying_symbol
+    st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
+
+if st.session_state["last_symbol"] != underlying_symbol:
+    st.session_state["last_symbol"] = underlying_symbol
+    st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
+    st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔌 Interactive Brokers (TWS) Import")
@@ -226,17 +243,9 @@ if st.sidebar.button("📥 Positions aus TWS Laden"):
 st.sidebar.markdown("---")
 st.sidebar.subheader("📝 Portfolio Positions Manager")
 
-default_legs = [
-    {"Enable": True, "Phase": "Initial", "Type": "C", "Strike": spot_price, "DTE": 30, "IV_%": base_iv, "Qty": 10, "Entry_Price": 12.0},
-    {"Enable": True, "Phase": "Initial", "Type": "P", "Strike": spot_price * 0.95, "DTE": 30, "IV_%": base_iv, "Qty": -10, "Entry_Price": 6.0},
-]
-
-if "legs_df" not in st.session_state:
-    st.session_state["legs_df"] = pd.DataFrame(default_legs)
-
 col_btn1, col_btn2 = st.sidebar.columns(2)
-if col_btn1.button("🔄 Reset Default"):
-    st.session_state["legs_df"] = pd.DataFrame(default_legs)
+if col_btn1.button("🔄 Sync/Reset Default"):
+    st.session_state["legs_df"] = pd.DataFrame(get_default_legs(spot_price, base_iv))
     st.rerun()
 
 if col_btn2.button("🗑️ Alle Löschen"):
@@ -267,11 +276,16 @@ st.session_state["legs_df"] = edited_df
 active_legs = edited_df[edited_df["Enable"] == True].copy() if not edited_df.empty else pd.DataFrame()
 initial_legs = active_legs[active_legs["Phase"] == "Initial"] if not active_legs.empty else pd.DataFrame()
 
-min_strike = active_legs["Strike"].min() if not active_legs.empty and "Strike" in active_legs else spot_price * 0.8
-max_strike = active_legs["Strike"].max() if not active_legs.empty and "Strike" in active_legs else spot_price * 1.2
+# Dynamische Achsen-Skalierung basierend auf den Strikes UND dem Spot-Preis
+if not active_legs.empty and "Strike" in active_legs and len(active_legs["Strike"].dropna()) > 0:
+    min_strike = active_legs["Strike"].min()
+    max_strike = active_legs["Strike"].max()
+    x_min = min(spot_price * 0.85, min_strike * 0.90)
+    x_max = max(spot_price * 1.15, max_strike * 1.10)
+else:
+    x_min = spot_price * 0.85
+    x_max = spot_price * 1.15
 
-x_min = min(spot_price * 0.85, min_strike * 0.90)
-x_max = max(spot_price * 1.15, max_strike * 1.10)
 spot_range = np.linspace(x_min, x_max, 500)
 
 pnl_t0 = np.zeros_like(spot_range)
