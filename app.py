@@ -17,11 +17,11 @@ from datetime import datetime, date, timedelta
 
 # Versuche ib_async oder ib_insync zu importieren
 try:
-    from ib_async import IB, Option, util
+    from ib_async import IB, Index, Stock, Option, util
     IBKR_AVAILABLE = True
 except ImportError:
     try:
-        from ib_insync import IB, Option, util
+        from ib_insync import IB, Index, Stock, Option, util
         IBKR_AVAILABLE = True
     except ImportError:
         IBKR_AVAILABLE = False
@@ -46,6 +46,63 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# --- IBKR CLIENT INITIALISIERUNG ---
+if "ib_client" not in st.session_state:
+    st.session_state["ib_client"] = None
+if "ib_connected" not in st.session_state:
+    st.session_state["ib_connected"] = False
+
+def connect_ibkr(host, port, client_id):
+    if not IBKR_AVAILABLE:
+        st.sidebar.error("❌ 'ib_async' oder 'ib_insync' ist nicht installiert!")
+        return False
+    try:
+        ib = IB()
+        ib.connect(host, port, clientId=client_id, timeout=5)
+        st.session_state["ib_client"] = ib
+        st.session_state["ib_connected"] = True
+        return True
+    except Exception as e:
+        st.sidebar.error(f"Verbindungsfehler: {e}")
+        st.session_state["ib_connected"] = False
+        return False
+
+def disconnect_ibkr():
+    if st.session_state.get("ib_client") and st.session_state["ib_connected"]:
+        try:
+            st.session_state["ib_client"].disconnect()
+        except Exception:
+            pass
+    st.session_state["ib_connected"] = False
+    st.session_state["ib_client"] = None
+
+def fetch_ibkr_spot(symbol):
+    ib = st.session_state.get("ib_client")
+    if not ib or not st.session_state.get("ib_connected"):
+        return None
+    try:
+        # Ticker-Spezifikation für IBKR
+        if symbol in ["SPX", "RUT"]:
+            contract = Index(symbol, 'CBOE', 'USD')
+        elif symbol in ["SPY", "QQQ"]:
+            contract = Stock(symbol, 'SMART', 'USD')
+        else:
+            contract = Stock(symbol, 'SMART', 'USD')
+            
+        ib.qualifyContracts(contract)
+        ticker_data = ib.reqMktData(contract, '', False, False)
+        ib.sleep(1)  # Kurze Pause für Datenempfang
+        
+        price = ticker_data.marketPrice()
+        if np.isnan(price) or price <= 0:
+            price = ticker_data.close
+            
+        if not np.isnan(price) and price > 0:
+            return round(float(price), 2)
+    except Exception as e:
+        st.sidebar.warning(f"IBKR Spot Abruf fehlgeschlagen für {symbol}: {e}")
+    return None
 
 # --- US MARKET HOLIDAYS (2025 - 2026) ---
 US_HOLIDAYS_2025_2026 = {
@@ -155,15 +212,13 @@ def calculate_phase_margin(legs_subset, spot_price):
             
     return round(total_margin, 2)
 
-# --- OPTION CHAIN BUILDER (MIT ITM / INTRINSIC VALUE & FARB-LOGIK) ---
+# --- OPTION CHAIN BUILDER ---
 def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=1.0, num_strikes=21):
     T = max(0.00001, dte / 365.0)
     atm_strike = round(spot / strike_step) * strike_step
     half_strikes = num_strikes // 2
     
-    # Sortierte Liste von Strikes (von tief nach hoch)
     strikes = [round(atm_strike + i * strike_step, 2) for i in range(-half_strikes, half_strikes + 1)]
-    
     chain = []
     
     for K in strikes:
@@ -177,7 +232,6 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=1.0, num
         p_price = bs_price('P', spot, K, T, r, sigma)
         p_greeks = bs_greeks('P', spot, K, T, r, sigma)
         
-        # In-The-Money Berechnungen
         call_itm = K < spot
         put_itm = K > spot
         is_atm = (abs(K - atm_strike) < 0.001)
@@ -214,7 +268,6 @@ def build_classic_option_chain(spot, dte, base_iv, r=0.045, strike_step=1.0, num
         
     return pd.DataFrame(chain)
 
-# Custom Styling für ITM & ATM Hervorhebung
 def highlight_option_chain(row):
     styles = [''] * len(row)
     is_atm = row.get("IS_ATM", False)
@@ -224,28 +277,24 @@ def highlight_option_chain(row):
     if is_atm:
         return ['background-color: #8b0000; color: white; font-weight: bold;'] * len(row)
     
-    # Indizes für Call Spalten (links) und Put Spalten (rechts)
     call_cols_idx = [i for i, col in enumerate(row.index) if col.startswith("C_")]
     put_cols_idx = [i for i, col in enumerate(row.index) if col.startswith("P_")]
     
-    # Farbschema für ITM Calls (Dunkelblau/Cyan Hintergrund)
     if c_itm:
         for idx in call_cols_idx:
             styles[idx] = 'background-color: #1a365d; color: #90caf9;'
             
-    # Farbschema für ITM Puts (Dunkelgrün/Teal Hintergrund)
     if p_itm:
         for idx in put_cols_idx:
             styles[idx] = 'background-color: #1b4332; color: #a7f3d0;'
             
     return styles
 
-# --- LIVE SPOT DATA ---
+# --- TICKER MAP (OHNE DAX) ---
 TICKER_MAP = {
     "SPX": "^GSPC",
     "SPY": "SPY",
     "RUT": "^RUT",
-    "DAX": "^GDAXI",
     "QQQ": "QQQ"
 }
 
@@ -270,19 +319,43 @@ def get_default_legs(current_spot, current_iv):
 # --- SIDEBAR & PORTFOLIO ---
 st.sidebar.title("⚙️ Base Settings & Positions")
 
+# --- IBKR VERBINDUNGS-PANEL ---
+with st.sidebar.expander("🔌 Interactive Brokers (IBKR) Connection", expanded=False):
+    ib_host = st.text_input("IP / Host", value="127.0.0.1")
+    ib_port = st.number_input("Port (7497 Paper / 7496 Live)", value=7497, step=1)
+    ib_client_id = st.number_input("Client ID", value=1, step=1)
+    
+    if not st.session_state["ib_connected"]:
+        if st.button("🔌 IBKR Verbinden"):
+            if connect_ibkr(ib_host, ib_port, ib_client_id):
+                st.success("🟢 Verbunden mit IBKR TWS/Gateway")
+                st.rerun()
+    else:
+        st.success("🟢 IBKR Verbunden")
+        if st.button("🔴 Trennen"):
+            disconnect_ibkr()
+            st.rerun()
+
 underlying_symbol = st.sidebar.selectbox("Underlying Symbol", list(TICKER_MAP.keys()), index=0)
 ticker = TICKER_MAP[underlying_symbol]
 
-live_spot = fetch_delayed_spot(ticker)
+# Spot Abruf: Priorität IBKR -> Fallback yfinance
+live_spot = None
+if st.session_state.get("ib_connected"):
+    live_spot = fetch_ibkr_spot(underlying_symbol)
+
+if live_spot is None:
+    live_spot = fetch_delayed_spot(ticker)
+
 default_spot = live_spot if live_spot is not None else (600.0 if underlying_symbol == "SPY" else 6000.0)
 
+spot_source_str = "IBKR Live" if st.session_state.get("ib_connected") and live_spot else ("Delayed/yFinance" if live_spot else "Manuell")
 spot_price = st.sidebar.number_input(
-    f"Spot Price ({'Live/Delayed' if live_spot else 'Manual'})", 
+    f"Spot Price ({spot_source_str})", 
     value=default_spot, 
     step=1.0
 )
 
-# Standardschrittweite für SPY, SPX, RUT auf 1.0 setzen
 default_step_idx = 0 if underlying_symbol in ["SPX", "SPY", "RUT"] else 2
 strike_step_val = st.sidebar.selectbox(
     "Strike Schrittweite (Option Chain)",
@@ -420,11 +493,9 @@ if not active_legs.empty:
             t_t0 = max(0.00001, dte / 365.0)
             t_t1 = max(0.00001, max(0.0, dte - 1) / 365.0)
             
-            # Einzelne Leg Expiration PnL berechnen
             leg_exp_prices = np.where(opt_type == 'C', np.maximum(0, spot_range - strike), np.maximum(0, strike - spot_range))
             single_leg_pnl_exp = (leg_exp_prices - entry) * qty * 100.0
             
-            # Kumuliere auf Gesamtposition
             pnl_exp += single_leg_pnl_exp
             leg_exp_curves.append((f"Leg {len(leg_exp_curves)+1}: {qty:+g} {opt_type} @ {strike}", single_leg_pnl_exp))
             
@@ -468,7 +539,7 @@ if not active_legs.empty:
 
 # --- MAIN WORKSPACE ---
 st.title(f"📈 OptionNet Explorer Professional ({underlying_symbol})")
-st.caption(f"Aktuell angezeigte Strategie/Position: **{selected_pos}**")
+st.caption(f"Aktuell angezeigte Strategie/Position: **{selected_pos}** | Datenquelle: `{spot_source_str}`")
 
 # KPI Spalten
 if show_margin:
@@ -548,7 +619,6 @@ st.subheader(f"📉 Risikograph Gesamtposition (Net Payoff) — {selected_pos}")
 
 fig = go.Figure()
 
-# 1. Haupt-Linie: Kombinierte Gesamtposition am Verfallstag
 fig.add_trace(go.Scatter(
     x=spot_range, 
     y=pnl_exp, 
@@ -557,7 +627,6 @@ fig.add_trace(go.Scatter(
     line=dict(color='#29b6f6', width=3)
 ))
 
-# 2. T+0 Linie (Heute)
 fig.add_trace(go.Scatter(
     x=spot_range, 
     y=pnl_t0, 
@@ -566,7 +635,6 @@ fig.add_trace(go.Scatter(
     line=dict(color='#ff5252', width=2)
 ))
 
-# 3. T+1 Linie (Morgen)
 fig.add_trace(go.Scatter(
     x=spot_range, 
     y=pnl_t1, 
@@ -575,7 +643,6 @@ fig.add_trace(go.Scatter(
     line=dict(color='#66bb6a', width=1.5, dash='dash')
 ))
 
-# 4. Optionale Anzeige der Einzel-Legs als gestrichelte Orientierungslinien
 if show_individual_legs_graph and len(leg_exp_curves) > 1:
     for leg_name, leg_pnl in leg_exp_curves:
         fig.add_trace(go.Scatter(
@@ -628,9 +695,7 @@ with tab_chain1:
     st.markdown(f"**Option Chain Layout (CALLS | STRIKE | PUTS) — Spot @ `{spot_price}` (Schrittweite: `{strike_step_val}`)**")
     st.caption("🟦 **Blau hinterlegt:** ITM Calls ($K < \\text{Spot}$) | 🟩 **Grün hinterlegt:** ITM Puts ($K > \\text{Spot}$) | 🟥 **Rot:** ATM Strike")
     
-    # Auszublendende Hilfs-Spalten für den Render-DataFrame
     cols_to_hide = ["C_ITM", "P_ITM", "IS_ATM"]
-    
     styled_df_1 = chain_df_1.style.apply(highlight_option_chain, axis=1).hide(axis="columns", subset=cols_to_hide)
     
     st.dataframe(
